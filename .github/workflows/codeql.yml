@@ -1,0 +1,48 @@
+name: codeql
+
+on:
+  push:
+    branches:
+      - main
+      - release-candidate/*
+      - public-ops/*
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  repository_state:
+    name: codeql-repository-state
+    runs-on: ubuntu-latest
+    outputs:
+      repository_state: ${{ steps.classify.outputs.repository_state }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify public repository state
+        id: classify
+        run: |
+          git log -1 --pretty=%B > "$RUNNER_TEMP/commit-message.txt"
+          python3 .github/scripts/public_repository_state.py \
+            --repo-root . \
+            --ref "${{ github.ref }}" \
+            --message-file "$RUNNER_TEMP/commit-message.txt" \
+            --github-output "$GITHUB_OUTPUT"
+
+  analyze:
+    name: codeql
+    runs-on: ubuntu-latest
+    needs: repository_state
+    if: needs.repository_state.outputs.repository_state == 'product_present'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: python
+      - uses: github/codeql-action/analyze@v4
