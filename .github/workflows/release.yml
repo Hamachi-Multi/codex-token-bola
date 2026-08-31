@@ -150,7 +150,14 @@ jobs:
   public_ops_candidate_guard:
     name: public-ops-candidate-guard
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/heads/public-ops/')
+    if: >-
+      ${{
+        always() &&
+        startsWith(github.ref, 'refs/heads/public-ops/') &&
+        needs.compile_test.result == 'success' &&
+        needs.public_sensitive_guard.result == 'success' &&
+        needs.release_dependency_audit.result == 'success'
+      }}
     needs:
       - compile_test
       - public_sensitive_guard
@@ -186,7 +193,14 @@ jobs:
   product_snapshot_guard:
     name: product-snapshot-guard
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      ${{
+        always() &&
+        github.ref == 'refs/heads/main' &&
+        needs.compile_test.result == 'success' &&
+        needs.public_sensitive_guard.result == 'success' &&
+        needs.release_dependency_audit.result == 'success'
+      }}
     permissions:
       contents: read
       checks: read
