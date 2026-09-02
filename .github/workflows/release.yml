@@ -58,6 +58,9 @@ jobs:
         run: make compile
       - name: Test
         run: make test
+      - name: Installed wheel smoke test
+        if: matrix.python-version == '3.10' && hashFiles('tests/wheel_smoke.py') != ''
+        run: make wheel-smoke
 
   compile_test:
     name: compile-test
