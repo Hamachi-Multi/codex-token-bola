@@ -15,17 +15,12 @@ SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-import service_lock
-
 import dashboard_cleanup_recovery as _recovery
 import dashboard_cleanup_payload as _payload
 import dashboard_cleanup_retention as _retention
 import dashboard_retention_index as _index
 import dashboard_retention_preview as _preview
 from raw_segments_common import ManifestError
-
-_SERVICE_LOCK_CONTRACT = service_lock.acquire_service_lock
-
 
 class CleanupDependencies:
     __slots__ = ("index", "payload", "preview", "recovery", "retention")
@@ -47,13 +42,16 @@ DEFAULT_CLEANUP_DEPENDENCIES = CleanupDependencies(
 )
 
 RetentionPreviewStale = _preview.RetentionPreviewStale
+RetentionApplyResult = _retention.RetentionApplyResult
 cleanup_retention_job_path = _recovery.cleanup_retention_job_path
 clear_cleanup_retention_job = _recovery.clear_cleanup_retention_job
 complete_retention_derived_rebuild = _recovery.complete_retention_derived_rebuild
 read_cleanup_retention_job = _recovery.read_cleanup_retention_job
 read_cleanup_retention_job_model = _recovery.read_cleanup_retention_job_model
+recover_retention_cleanup = _recovery.recover_retention_cleanup
 reset_derived_outputs = _retention.reset_derived_outputs
 retention_preview_signature = _preview.retention_preview_signature
+retention_preview_with_signature = _preview.retention_preview_with_signature
 write_cleanup_retention_job = _recovery.write_cleanup_retention_job
 discard_delete_logs_older_than_plan = _retention.discard_delete_logs_older_than_plan
 ensure_service_owned_output = _retention.ensure_service_owned_output
@@ -96,6 +94,10 @@ def validate_delete_logs_older_than_plan(plan: dict[str, Any]) -> dict[str, Any]
 
 
 def apply_delete_logs_older_than_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    return apply_delete_logs_older_than_plan_result(plan).summary
+
+
+def apply_delete_logs_older_than_plan_result(plan: dict[str, Any]) -> RetentionApplyResult:
     return DEFAULT_CLEANUP_DEPENDENCIES.retention.apply_delete_logs_older_than_plan(plan)
 
 
@@ -143,7 +145,9 @@ def delete_all_logs(token_usage_root: pathlib.Path | str, db_path: pathlib.Path 
 __all__ = [
     "ManifestError",
     "RetentionPreviewStale",
+    "RetentionApplyResult",
     "apply_delete_logs_older_than_plan",
+    "apply_delete_logs_older_than_plan_result",
     "cleanup_detail_payload",
     "cleanup_payload",
     "cleanup_retention_job_path",
@@ -162,6 +166,7 @@ __all__ = [
     "reset_derived_outputs",
     "retention_preview",
     "retention_preview_signature",
+    "retention_preview_with_signature",
     "validate_delete_logs_older_than_plan",
     "write_cleanup_retention_job",
 ]

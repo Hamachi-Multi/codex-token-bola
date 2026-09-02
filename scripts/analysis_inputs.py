@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 
+import retention_pruned_store
 import service_paths
 
 
@@ -20,7 +21,7 @@ def analysis_input_paths(
     return [
         state_db_path,
         state_db_path.parent / "session_index.jsonl",
-        service_paths.output_dir_path(output_dir) / "state" / "retention-pruned-turns.json",
+        *retention_pruned_store.fingerprint_paths(service_paths.output_dir_path(output_dir)),
     ]
 
 

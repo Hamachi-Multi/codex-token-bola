@@ -1,6 +1,6 @@
 PYTHON ?= python3
 
-.PHONY: test compile ci lint doctor build serve pipeline playwright-install ui-check ui-check-live
+.PHONY: test compile ci lint doctor build wheel-smoke serve pipeline playwright-install ui-check ui-check-live
 
 compile:
 	$(PYTHON) -m py_compile codex_token_bola/*.py scripts/*.py
@@ -18,6 +18,9 @@ doctor:
 
 build:
 	$(PYTHON) -m codex_token_bola build
+
+wheel-smoke:
+	$(PYTHON) tests/wheel_smoke.py
 
 pipeline:
 	$(PYTHON) -m codex_token_bola pipeline

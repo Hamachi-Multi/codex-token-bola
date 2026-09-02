@@ -28,8 +28,9 @@ from dashboard_cleanup_retention import pending_turn_state_paths, plan_pending_t
 from dashboard_retention_index import default_retention_cutoff_unix
 from dashboard_retention_preview import (
     clear_retention_preview_cache,
-    retention_preview,
     retention_preview_signature,
+    retention_preview,
+    retention_preview_with_signature,
 )
 
 
@@ -218,8 +219,11 @@ def cleanup_payload(
 
     now_unix = time.time()
     cutoff_unix = float(retention_cutoff_unix) if retention_cutoff_unix is not None else default_retention_cutoff_unix(now_unix)
-    selected_retention = retention_preview(base, cutoff_unix, refresh_index=refresh_retention_index)
-    selected_retention["preview_signature"] = retention_preview_signature(base, cutoff_unix)
+    selected_retention = retention_preview_with_signature(
+        base,
+        cutoff_unix,
+        refresh_index=refresh_retention_index,
+    )
     selected_retention["source_files"] = len(selected_retention.get("files", []))
     selected_retention["all_files"] = sum(
         1 for file in selected_retention.get("files", []) if int(file.get("scanned_rows") or 0) > 0 or int(file.get("source_size") or 0) > 0

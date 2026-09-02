@@ -48,6 +48,24 @@ def retention_preview_signature(base: pathlib.Path, cutoff_unix: float) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def retention_preview_with_signature(
+    token_usage_root: pathlib.Path | str,
+    cutoff_unix: float,
+    *,
+    refresh_index: bool = True,
+) -> dict[str, Any]:
+    """Return a preview only when its source state stayed stable while calculated."""
+    base = pathlib.Path(token_usage_root).expanduser()
+    cutoff = float(cutoff_unix)
+    for _attempt in range(2):
+        before = retention_preview_signature(base, cutoff)
+        preview = retention_preview(base, cutoff, refresh_index=refresh_index)
+        after = retention_preview_signature(base, cutoff)
+        if before == after:
+            return {**preview, "preview_signature": after}
+    raise RetentionPreviewStale("cleanup preview changed while it was calculated")
+
+
 def freeze_retention_snapshot(base: pathlib.Path, cutoff_unix: float, expected_signature: str) -> dict[str, Any]:
     """Validate the preview and swap current pointers under one append lock."""
     raw_segments.reconcile_pending_rotation(base)

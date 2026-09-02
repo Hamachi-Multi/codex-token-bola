@@ -18,26 +18,28 @@ import progress_control
 import raw_segments
 import service_lock
 import service_paths
+from runtime_command_runner import ProcessResult, process_result_from_output, required_json_contract_error
 
 
 class DashboardCleanupApiMixin:
     def begin_cleanup_operation(self):
         manager = self.dashboard_operation_manager()
         try:
-            return manager.begin("cleanup", self.dashboard_output_dir())
+            starter = getattr(self, "begin_dashboard_operation", None)
+            return starter("cleanup") if callable(starter) else manager.begin("cleanup", self.dashboard_output_dir())
         except operation_state.ServerShuttingDown:
             self.send_json({"error": "server_shutting_down"}, 503)
         except operation_state.OperationBusy:
             self.send_json(manager.busy_payload(), 409)
         return None
 
-    def _dashboard_db_path(self) -> pathlib.Path:
-        resolver = getattr(self, "dashboard_db_path", None)
-        if callable(resolver):
-            return pathlib.Path(resolver())
-        return pathlib.Path(self.server.db_path)
-
-    def run_managed_cleanup_command(self, cmd: list[str], *, env: dict[str, str]) -> dict[str, Any]:
+    def run_managed_cleanup_command(
+        self,
+        cmd: list[str],
+        *,
+        command_name: str,
+        env: dict[str, str],
+    ) -> ProcessResult:
         manager = self.dashboard_operation_manager()
         active = manager.active_record()
         if active is None or active.kind != "cleanup":
@@ -65,12 +67,7 @@ class DashboardCleanupApiMixin:
                 stderr_file.seek(0)
                 stdout = stdout_file.read().strip()
                 stderr = stderr_file.read().strip()
-        return {
-            "returncode": returncode,
-            "stdout": stdout,
-            "stderr": stderr,
-            "metadata": self.parse_last_json(stdout),
-        }
+        return process_result_from_output(command_name, returncode, stdout, stderr)
 
     def run_compact_command(self, output: pathlib.Path, min_bytes: int):
         script = self.dashboard_script_dir() / "bola.py"
@@ -83,7 +80,11 @@ class DashboardCleanupApiMixin:
             "--output-dir",
             str(self.dashboard_output_dir()),
         ]
-        return self.run_managed_cleanup_command(cmd, env=service_lock.scrub_lock_env(os.environ.copy()))
+        return self.run_managed_cleanup_command(
+            cmd,
+            command_name="compact",
+            env=service_lock.scrub_lock_env(os.environ.copy()),
+        )
 
     def begin_cleanup_progress(self, *, phase: str, phase_index: int, checkpoint: str, phase_progress: float = 0.0) -> pathlib.Path:
         manager = self.dashboard_operation_manager()
@@ -140,9 +141,13 @@ class DashboardCleanupApiMixin:
         ]
         if incremental:
             cmd.append("--incremental")
-        return self.run_managed_cleanup_command(cmd, env=service_lock.scrub_lock_env(os.environ.copy()))
+        return self.run_managed_cleanup_command(
+            cmd,
+            command_name="pipeline",
+            env=service_lock.scrub_lock_env(os.environ.copy()),
+        )
 
-    def run_retention_prune_command(self, cutoff_unix: float, preview_signature: str) -> dict[str, Any]:
+    def run_retention_prune_command(self, cutoff_unix: float, preview_signature: str) -> ProcessResult:
         script = self.dashboard_script_dir() / "bola.py"
         cmd = [
             sys.executable,
@@ -161,7 +166,7 @@ class DashboardCleanupApiMixin:
         _active, progress_file, _running = self.dashboard_operation_manager().progress_snapshot("cleanup")
         if progress_file is not None:
             env[progress_control.PROGRESS_ENV] = str(progress_file)
-        return self.run_managed_cleanup_command(cmd, env=env)
+        return self.run_managed_cleanup_command(cmd, command_name="retention-prune", env=env)
 
     @staticmethod
     def cleanup_option_value(value: Any = None) -> Any:
@@ -232,24 +237,28 @@ class DashboardCleanupApiMixin:
             except (TypeError, ValueError):
                 min_bytes = 1
             min_bytes = max(1, min(min_bytes, 1024 * 1024 * 1024))
-            output = self._dashboard_db_path().expanduser().resolve()
+            output = pathlib.Path(self.dashboard_db_path()).expanduser().resolve()
             result = self.run_compact_command(output, min_bytes)
-            if result["returncode"] != 0:
+            if result.exit_code != 0:
                 self.send_json(
                     {
                         "error": "cleanup_failed",
-                        "returncode": result["returncode"],
-                        "stderr": str(result["stderr"])[-4000:],
-                        "stdout": str(result["stdout"])[-4000:],
+                        "returncode": result.exit_code,
+                        "stderr": result.stderr[-4000:],
+                        "stdout": result.stdout[-4000:],
                     },
                     500,
                 )
+                return
+            contract_error = required_json_contract_error(result, operation="compact")
+            if contract_error is not None:
+                self.send_json(contract_error, 500)
                 return
             dashboard_cleanup.refresh_retention_index_for_current_sources(self.dashboard_output_dir())
             self.send_json(
                 {
                     "ok": True,
-                    "compact": result["metadata"],
+                    "compact": result.payload,
                     "cleanup": self.cleanup_payload(db_path=output),
                     "elapsed_ms": round((time.monotonic() - started) * 1000),
                 }
@@ -268,7 +277,7 @@ class DashboardCleanupApiMixin:
             if options.get("confirm_all_logs") is not True:
                 self.send_json({"error": "delete_all_confirmation_required"}, 400)
                 return
-            output = self._dashboard_db_path().expanduser().resolve()
+            output = pathlib.Path(self.dashboard_db_path()).expanduser().resolve()
             progress_file = self.begin_cleanup_progress(
                 phase="cleanup-delete",
                 phase_index=1,
@@ -325,7 +334,7 @@ class DashboardCleanupApiMixin:
             cutoff_date = str(selection["cutoff_date"])
             timezone_name = str(selection["timezone"])
             cutoff_unix = float(selection["cutoff_unix"])
-            output = self._dashboard_db_path().expanduser().resolve()
+            output = pathlib.Path(self.dashboard_db_path()).expanduser().resolve()
             preview_signature = options.get("preview_signature")
             if not isinstance(preview_signature, str) or not preview_signature:
                 self.send_json({"error": "cleanup_preview_signature_required"}, 400)
@@ -372,9 +381,9 @@ class DashboardCleanupApiMixin:
                 phase_progress=0.0,
             )
             prune_result = self.run_retention_prune_command(cutoff_unix, preview_signature)
-            metadata = prune_result.get("metadata") if isinstance(prune_result.get("metadata"), dict) else {}
-            degraded = prune_result["returncode"] == 1 and metadata.get("status") == "degraded"
-            if prune_result["returncode"] != 0 and not degraded:
+            metadata = prune_result.payload or {}
+            degraded = prune_result.exit_code == 1 and metadata.get("status") == "degraded"
+            if prune_result.exit_code != 0 and not degraded:
                 if metadata.get("error") == "cleanup_preview_stale":
                     self.write_cleanup_progress(
                         progress_file, status="failed", phase="cleanup-prepare", phase_index=0, checkpoint="stale-preview", phase_progress=0.0
@@ -386,7 +395,7 @@ class DashboardCleanupApiMixin:
                     self.send_json(
                         {
                             **operation_state.service_busy_payload(lock_path=metadata.get("lock_path")),
-                            "returncode": prune_result["returncode"],
+                            "returncode": prune_result.exit_code,
                         },
                         409,
                     )
@@ -402,7 +411,7 @@ class DashboardCleanupApiMixin:
                 self.send_json(
                     {
                         "error": "retention_prune_failed",
-                        "returncode": prune_result["returncode"],
+                        "returncode": prune_result.exit_code,
                         "partial_mutation": bool(metadata.get("partial_mutation")),
                         "recovery_required": bool(metadata.get("recovery_required")),
                         "derived_rebuild_required": bool(metadata.get("derived_rebuild_required")),
@@ -410,11 +419,23 @@ class DashboardCleanupApiMixin:
                         "pending_files": int(metadata.get("pending_files") or 0),
                         "stage": metadata.get("stage"),
                         "deleted_rows": metadata.get("deleted_rows", 0),
-                        "stderr": str(prune_result["stderr"])[-4000:],
-                        "stdout": str(prune_result["stdout"])[-4000:],
+                        "stderr": prune_result.stderr[-4000:],
+                        "stdout": prune_result.stdout[-4000:],
                     },
                     500,
                 )
+                return
+            contract_error = required_json_contract_error(prune_result, operation="retention-prune")
+            if contract_error is not None:
+                self.write_cleanup_progress(
+                    progress_file,
+                    status="failed",
+                    phase="cleanup-delete",
+                    phase_index=1,
+                    checkpoint="result-contract",
+                    phase_progress=0.0,
+                )
+                self.send_json(contract_error, 500)
                 return
             retention_result = metadata.get("delete") if isinstance(metadata.get("delete"), dict) else {"deleted_rows": metadata.get("deleted_rows", 0)}
             retention_result = {
@@ -458,7 +479,7 @@ class DashboardCleanupApiMixin:
         *,
         refresh_retention_index: bool = True,
     ):
-        db = pathlib.Path(db_path).expanduser() if db_path is not None else self._dashboard_db_path().expanduser()
+        db = pathlib.Path(db_path).expanduser() if db_path is not None else pathlib.Path(self.dashboard_db_path()).expanduser()
         return dashboard_cleanup.cleanup_payload(
             self.dashboard_output_dir(), db, base_dir, retention_cutoff_unix, refresh_retention_index=refresh_retention_index
         )
@@ -473,7 +494,7 @@ class DashboardCleanupApiMixin:
         page: int = 1,
         page_size: int = 25,
     ):
-        db = pathlib.Path(db_path).expanduser() if db_path is not None else self._dashboard_db_path().expanduser()
+        db = pathlib.Path(db_path).expanduser() if db_path is not None else pathlib.Path(self.dashboard_db_path()).expanduser()
         return dashboard_cleanup.cleanup_detail_payload(
             self.dashboard_output_dir(), db, group_id, base_dir, retention_cutoff_unix, preview_signature, page, page_size
         )

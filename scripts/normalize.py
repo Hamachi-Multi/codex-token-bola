@@ -25,6 +25,7 @@ import cancel_control
 import progress_control
 import quarantine_health
 import normalize_publish
+from normalize_contract import NORMALIZE_LOGIC_VERSION
 import transcript_parser
 import turn_capture
 import turn_lifecycle
@@ -38,7 +39,6 @@ NORMALIZED_LOG = OUTPUT_LAYOUT.normalized_log
 BAD_LOG = OUTPUT_LAYOUT.bad_dir / "prompt-usage.bad.jsonl"
 STATE_FILE = OUTPUT_LAYOUT.normalize_state
 USAGE_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens")
-NORMALIZE_LOGIC_VERSION = 7
 TRANSCRIPT_LIFECYCLE_CACHE_MAXSIZE = 256
 QUARANTINE_RESULTS: list[dict[str, Any]] = []
 
@@ -228,7 +228,8 @@ def recover_missing_start_state_lifecycle(row: dict[str, Any]) -> dict[str, Any]
     if not snapshot.get("found"):
         return row
     status = str(snapshot.get("turn_status") or "completed")
-    resolution_status = turn_resolution.RESOLVED if safe_int(snapshot.get("event_count")) > 0 else turn_resolution.UNAVAILABLE
+    usable_count = safe_int(snapshot.get("usable_last_token_usage_count"))
+    resolution_status = turn_resolution.RESOLVED if usable_count > 0 else turn_resolution.UNAVAILABLE
     resolution_reason = None if resolution_status == turn_resolution.RESOLVED else f"no_token_count_before_{'task_aborted' if status == 'aborted' else 'task_complete'}"
     recovered = dict(row)
     recovered.update(
@@ -245,6 +246,7 @@ def recover_missing_start_state_lifecycle(row: dict[str, Any]) -> dict[str, Any]
                 "found": True,
                 "path": snapshot.get("path"),
                 "event_count": snapshot.get("event_count"),
+                "usable_last_token_usage_count": usable_count,
                 "parse_error_seen": snapshot.get("parse_error_seen"),
                 "turn_status": status,
                 "turn_started_at": snapshot.get("turn_started_at"),
@@ -252,7 +254,7 @@ def recover_missing_start_state_lifecycle(row: dict[str, Any]) -> dict[str, Any]
                 "total_token_usage": snapshot.get("total_token_usage"),
                 "token_source": snapshot.get("token_source"),
             },
-            "model_call_count": safe_int(snapshot.get("event_count")),
+            "model_call_count": usable_count,
             "token_source": snapshot.get("token_source"),
         }
     )
@@ -279,8 +281,8 @@ def recover_pending_token_resolution(row: dict[str, Any]) -> dict[str, Any]:
         )
         return unavailable
     status = str(snapshot.get("turn_status") or row.get("turn_status") or "completed")
-    event_count = safe_int(snapshot.get("event_count"))
-    resolution_status = turn_resolution.RESOLVED if event_count > 0 else turn_resolution.UNAVAILABLE
+    usable_count = safe_int(snapshot.get("usable_last_token_usage_count"))
+    resolution_status = turn_resolution.RESOLVED if usable_count > 0 else turn_resolution.UNAVAILABLE
     resolution_reason = None if resolution_status == turn_resolution.RESOLVED else f"no_token_count_before_{'task_aborted' if status == 'aborted' else 'task_complete'}"
     recovered = dict(row)
     recovered.update(
@@ -294,7 +296,7 @@ def recover_pending_token_resolution(row: dict[str, Any]) -> dict[str, Any]:
             "usage": snapshot.get("total_token_usage"),
             "end_token_usage": snapshot.get("total_token_usage"),
             "end_token_snapshot": dict(snapshot),
-            "model_call_count": event_count,
+            "model_call_count": usable_count,
             "token_source": snapshot.get("token_source"),
             "estimated": True,
         }
@@ -304,22 +306,6 @@ def recover_pending_token_resolution(row: dict[str, Any]) -> dict[str, Any]:
 
 def unresolved_zero_estimate(row: dict[str, Any]) -> bool:
     return turn_resolution.status_from_row(row) == turn_resolution.PENDING
-
-
-def record_unavailable_event(row: dict[str, Any]) -> None:
-    event, evidence_path, captured_at_ns = turn_resolution.write_unavailable_evidence(token_usage_root(), row)
-    row["token_resolution_event_id"] = event
-    QUARANTINE_RESULTS.append(
-        quarantine_health.record_event(
-            token_usage_root(),
-            event=event,
-            kind=turn_resolution.UNAVAILABLE_KIND,
-            source=str(row.get("transcript_path") or "unknown"),
-            error=str(row.get("token_resolution_reason") or "unknown"),
-            evidence_path=evidence_path,
-            captured_at_ns=captured_at_ns,
-        )
-    )
 
 
 def append_bad(source: str, line_no: int, line: str, error: str) -> None:
@@ -549,6 +535,7 @@ def full_turn_sources() -> list[pathlib.Path]:
 
 
 def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
+    row = repair_terminal_metadata(row)
     row = recover_missing_start_state_lifecycle(row)
     row = recover_pending_token_resolution(row)
     status = row.get("turn_status") or "completed"
@@ -582,6 +569,23 @@ def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
             snapshot.pop("model_calls", None)
             normalized[snapshot_key] = snapshot
     return normalized
+
+
+def repair_terminal_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    terminal = row.get("turn_end_event")
+    if not isinstance(terminal, dict):
+        snapshot = row.get("end_token_snapshot")
+        terminal = snapshot.get("turn_end_event") if isinstance(snapshot, dict) else None
+    status = turn_lifecycle.terminal_status(terminal)
+    if status is None:
+        return row
+    repaired = dict(row)
+    repaired["turn_status"] = status
+    repaired["lifecycle_end_reason"] = turn_lifecycle.terminal_reason(terminal)
+    stopped_at = turn_lifecycle.terminal_stopped_at(terminal)
+    if stopped_at is not None:
+        repaired["stopped_at"] = stopped_at
+    return repaired
 
 
 def rank(row: dict[str, Any]) -> tuple[int, int, int, int, int]:
@@ -893,7 +897,7 @@ def full_normalize() -> dict[str, Any]:
     rows = sorted(by_turn.values(), key=lambda item: (str(item.get("captured_at") or ""), str(item.get("turn_id") or "")))
     for row in rows:
         if turn_resolution.status_from_row(row) == turn_resolution.UNAVAILABLE:
-            record_unavailable_event(row)
+            QUARANTINE_RESULTS.append(quarantine_health.record_unavailable(token_usage_root(), row))
         row.pop("_source_priority", None)
     commit_normalized_publish(
         rollback_offset=0,
@@ -958,7 +962,7 @@ def incremental_normalize() -> dict[str, Any]:
     rows = sorted(by_turn.values(), key=lambda item: (str(item.get("captured_at") or ""), str(item.get("turn_id") or "")))
     for row in rows:
         if turn_resolution.status_from_row(row) == turn_resolution.UNAVAILABLE:
-            record_unavailable_event(row)
+            QUARANTINE_RESULTS.append(quarantine_health.record_unavailable(token_usage_root(), row))
         row.pop("_source_priority", None)
     cancel_control.check_cancelled("normalize", "publish-incremental")
     progress_control.write_progress(phase="normalize", phase_index=0, checkpoint="publish-incremental", phase_progress=0.98)

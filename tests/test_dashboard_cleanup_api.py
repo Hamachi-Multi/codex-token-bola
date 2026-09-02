@@ -6,6 +6,7 @@ try:
         DashboardFixtureMixin,
         ROOT,
         datetime,
+        json,
         load_module,
         mock,
         pathlib,
@@ -19,6 +20,7 @@ except ModuleNotFoundError:
         DashboardFixtureMixin,
         ROOT,
         datetime,
+        json,
         load_module,
         mock,
         pathlib,
@@ -160,9 +162,9 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
         handler.cleanup_payload = lambda db_path=None: {"rows": []}
 
-        def fake_compact(output: pathlib.Path, min_bytes: int) -> dict[str, object]:
+        def fake_compact(output: pathlib.Path, min_bytes: int):
             calls.append((output, min_bytes))
-            return {"returncode": 0, "stdout": "{}", "stderr": "", "metadata": {"ok": True}}
+            return serve.dashboard_cleanup_api.process_result_from_output("compact", 0, '{"ok":true}', "")
 
         handler.run_compact_command = fake_compact
         with mock.patch.object(serve.dashboard_cleanup, "refresh_retention_index_for_current_sources", return_value={}):
@@ -170,6 +172,26 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
 
         self.assertEqual(sent[0][1], 200)
         self.assertEqual(calls, [(pathlib.Path("/tmp/bola.sqlite"), 2048)])
+
+    def test_log_cleanup_compact_rejects_success_without_json_result(self) -> None:
+        serve = load_module("serve_dashboard_compact_result_contract_test", ROOT / "scripts" / "serve_dashboard.py")
+        handler = serve.Handler.__new__(serve.Handler)
+        sent: list[tuple[dict[str, object], int]] = []
+        handler.server = types.SimpleNamespace(db_path="/tmp/bola.sqlite")
+        handler.read_json_body = lambda: {}
+        handler.send_json = lambda payload, status=200: sent.append((payload, status))
+        handler.run_compact_command = lambda _output, _min_bytes: (
+            serve.dashboard_cleanup_api.process_result_from_output("compact", 0, "log only", "")
+        )
+
+        with mock.patch.object(serve.dashboard_cleanup, "refresh_retention_index_for_current_sources") as refresh:
+            handler.handle_cleanup_compact()
+
+        self.assertEqual(sent[0][1], 500)
+        self.assertEqual(sent[0][0]["error"], "child_output_contract_failed")
+        self.assertEqual(sent[0][0]["operation"], "compact")
+        self.assertEqual(sent[0][0]["parse_error"], "json_object_missing")
+        refresh.assert_not_called()
 
     def test_log_cleanup_detail_api_does_not_open_dashboard_database(self) -> None:
         serve = load_module("serve_dashboard_cleanup_detail_api_db_test", ROOT / "scripts" / "serve_dashboard.py")
@@ -528,12 +550,11 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
             "rows": [],
             "retention": {"selected": {"preview_signature": "fresh", "deletable_rows": 1}},
         }
-        handler.run_retention_prune_command = lambda _cutoff, _preview_signature: {
-            "returncode": 2,
-            "stdout": '{"error":"cleanup_preview_stale"}',
-            "stderr": "",
-            "metadata": {"error": "cleanup_preview_stale"},
-        }
+        handler.run_retention_prune_command = lambda _cutoff, _preview_signature: (
+            serve.dashboard_cleanup_api.process_result_from_output(
+                "retention-prune", 2, '{"error":"cleanup_preview_stale"}', ""
+            )
+        )
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
 
         handler.handle_cleanup_retention()
@@ -550,20 +571,24 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: {
             "retention": {"selected": {"preview_signature": "fresh", "deletable_rows": 1}}
         }
-        handler.run_retention_prune_command = lambda _cutoff, _preview_signature: {
-            "returncode": 1,
-            "stdout": '{"partial_mutation":true,"stage":"build","deleted_rows":3}',
-            "stderr": "build failed",
-            "metadata": {
-                "partial_mutation": True,
-                "recovery_required": True,
-                "derived_rebuild_required": True,
-                "physical_delete_pending": True,
-                "pending_files": 2,
-                "stage": "build",
-                "deleted_rows": 3,
-            },
-        }
+        handler.run_retention_prune_command = lambda _cutoff, _preview_signature: (
+            serve.dashboard_cleanup_api.process_result_from_output(
+                "retention-prune",
+                1,
+                json.dumps(
+                    {
+                        "partial_mutation": True,
+                        "recovery_required": True,
+                        "derived_rebuild_required": True,
+                        "physical_delete_pending": True,
+                        "pending_files": 2,
+                        "stage": "build",
+                        "deleted_rows": 3,
+                    }
+                ),
+                "build failed",
+            )
+        )
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
 
         handler.handle_cleanup_retention()
@@ -586,16 +611,20 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         handler.server = types.SimpleNamespace(db_path="/tmp/bola.sqlite")
         handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "timezone": "Asia/Seoul", "preview_signature": "fresh"}
         handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: cleanup_payload
-        handler.run_retention_prune_command = lambda _cutoff, _preview_signature: {
-            "returncode": 1,
-            "stdout": "",
-            "stderr": "",
-            "metadata": {
-                "status": "degraded",
-                "quarantine": {"unacknowledged_events": 1},
-                "delete": {"deleted_rows": 3},
-            },
-        }
+        handler.run_retention_prune_command = lambda _cutoff, _preview_signature: (
+            serve.dashboard_cleanup_api.process_result_from_output(
+                "retention-prune",
+                1,
+                json.dumps(
+                    {
+                        "status": "degraded",
+                        "quarantine": {"unacknowledged_events": 1},
+                        "delete": {"deleted_rows": 3},
+                    }
+                ),
+                "",
+            )
+        )
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
 
         handler.handle_cleanup_retention()
@@ -654,10 +683,16 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
             self.assertEqual(outside.read_text(encoding="utf-8"), "keep")
 
     def test_log_cleanup_delete_all_uses_service_lock(self) -> None:
-        source = (ROOT / "scripts" / "dashboard_cleanup.py").read_text(encoding="utf-8")
+        cleanup = load_module("dashboard_cleanup_service_lock_test", ROOT / "scripts" / "dashboard_cleanup.py")
+        lock_module = cleanup.DEFAULT_CLEANUP_DEPENDENCIES.payload.service_lock
+        acquire = lock_module.acquire_service_lock
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = pathlib.Path(tmp_dir) / "output"
+            (base / "state").mkdir(parents=True)
+            with mock.patch.object(lock_module, "acquire_service_lock", wraps=acquire) as acquire_service_lock:
+                cleanup.delete_all_logs(base)
 
-        self.assertIn("import service_lock", source)
-        self.assertIn("service_lock.acquire_service_lock", source)
+        acquire_service_lock.assert_called_once_with(base / "state" / "service.lock", reason="delete-all")
 
     def test_log_cleanup_delete_all_api_requires_confirmation(self) -> None:
         serve = load_module("serve_dashboard_delete_all_confirm_test", ROOT / "scripts" / "serve_dashboard.py")
@@ -744,7 +779,12 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "timezone": "Asia/Seoul", "preview_signature": "fresh"}
         handler.run_retention_prune_command = lambda cutoff, preview_signature: (
             calls.append((cutoff, preview_signature))
-            or {"returncode": 0, "stdout": '{"deleted_rows":1}', "stderr": "", "metadata": {"deleted_rows": 1, "delete": {"deleted_rows": 1}}}
+            or serve.dashboard_cleanup_api.process_result_from_output(
+                "retention-prune",
+                0,
+                '{"deleted_rows":1,"delete":{"deleted_rows":1}}',
+                "",
+            )
         )
         handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: {
             "summary": {},
@@ -760,6 +800,33 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual(sent[0][1], 200)
         self.assertEqual(sent[0][0]["retention"]["deleted_rows"], 1)
         self.assertIn("cleanup", sent[0][0])
+
+    def test_log_cleanup_retention_rejects_success_without_json_result(self) -> None:
+        serve = load_module("serve_dashboard_retention_result_contract_test", ROOT / "scripts" / "serve_dashboard.py")
+        handler = serve.Handler.__new__(serve.Handler)
+        sent: list[tuple[dict[str, object], int]] = []
+        handler.server = types.SimpleNamespace(db_path="/tmp/bola.sqlite")
+        handler.read_json_body = lambda: {
+            "cutoff_date": "2026-05-20",
+            "timezone": "Asia/Seoul",
+            "preview_signature": "fresh",
+        }
+        handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: {
+            "retention": {"selected": {"preview_signature": "fresh", "deletable_rows": 1}}
+        }
+        handler.run_retention_prune_command = lambda _cutoff, _signature: (
+            serve.dashboard_cleanup_api.process_result_from_output("retention-prune", 0, "", "")
+        )
+        handler.send_json = lambda payload, status=200: sent.append((payload, status))
+
+        with mock.patch.object(serve.dashboard_cleanup, "refresh_retention_index_for_current_sources") as refresh:
+            handler.handle_cleanup_retention()
+
+        self.assertEqual(sent[0][1], 500)
+        self.assertEqual(sent[0][0]["error"], "child_output_contract_failed")
+        self.assertEqual(sent[0][0]["operation"], "retention-prune")
+        self.assertEqual(sent[0][0]["parse_error"], "stdout_empty")
+        refresh.assert_not_called()
 
     def test_log_cleanup_progress_endpoint_reads_cleanup_snapshot(self) -> None:
         serve = load_module("serve_dashboard_cleanup_progress_endpoint_test", ROOT / "scripts" / "serve_dashboard.py")

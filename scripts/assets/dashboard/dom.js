@@ -1,4 +1,4 @@
-import { fmt, state } from './core.js';
+import { defaultTurnSortDir, fmt, state } from './core.js';
 import { esc } from './ui.js';
 
 export function handleListArrowFocus(event, selector, activate = false) {
@@ -80,10 +80,6 @@ export function metric(label, value, kind = '', title = '', labelAddon = '') {
   const cls = kind ? `metric ${kind}` : 'metric';
   const titleAttr = title ? ` title="${esc(title)}"` : '';
   return `<div class="${cls}"><div class="label">${esc(label)}${labelAddon}</div><div class="value"${titleAttr}>${esc(value)}</div></div>`;
-}
-
-function defaultTurnSortDir(key) {
-  return ['session', 'prompt', 'status'].includes(key) ? 'asc' : 'desc';
 }
 
 export function tableHeader(header, sortState = null) {

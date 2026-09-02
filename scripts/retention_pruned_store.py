@@ -37,6 +37,16 @@ def database_path(base: pathlib.Path | str) -> pathlib.Path:
     return pathlib.Path(base).expanduser() / DB_RELATIVE_PATH
 
 
+def fingerprint_paths(base: pathlib.Path | str) -> list[pathlib.Path]:
+    root = pathlib.Path(base).expanduser()
+    path = database_path(root)
+    return [
+        path,
+        path.with_name(f"{path.name}-wal"),
+        *(root / relative for relative in LEGACY_RELATIVE_PATHS),
+    ]
+
+
 def inspect_summary(base: pathlib.Path | str) -> dict[str, Any]:
     """Inspect the durable store without creating, migrating, or updating it."""
     path = database_path(base)
@@ -478,6 +488,40 @@ def snapshot_rows(base: pathlib.Path | str) -> dict[tuple[str, str], dict[str, A
                 raise RetentionPrunedStoreError(f"conflicting retention pruned turn row: {key[0]}/{key[1]}")
             if previous is None or previous.get("state") != "committed":
                 result[key] = item
+    return result
+
+
+def snapshot_legacy_pending_rows(base: pathlib.Path | str) -> list[dict[str, Any]]:
+    """Read every unresolved legacy pending row without collapsing it into SQLite state."""
+    root = pathlib.Path(base).expanduser()
+    result: list[dict[str, Any]] = []
+    for relative in LEGACY_RELATIVE_PATHS:
+        legacy_path = root / relative
+        if not legacy_path.name.endswith(".pending.json"):
+            continue
+        payload = _legacy_payload(legacy_path)
+        if payload is None:
+            continue
+        pruned_at = _safe_float(payload.get("updated_at_unix"), legacy_path.stat().st_mtime)
+        for value in payload.get("pruned_turns") or []:
+            if not isinstance(value, dict):
+                continue
+            row = normalize_row(value, pruned_at_unix=pruned_at)
+            if row is None:
+                continue
+            result.append(
+                {
+                    "session_id": row[0],
+                    "turn_id": row[1],
+                    "start_ts": row[2],
+                    "stop_ts": row[3],
+                    "captured_at_unix": row[4],
+                    "pruned_at_unix": row[5],
+                    "last_required_at_unix": row[6],
+                    "state": "pending",
+                    "job_id": f"legacy:{legacy_path.name}",
+                }
+            )
     return result
 
 

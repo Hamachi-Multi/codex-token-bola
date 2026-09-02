@@ -1,4 +1,5 @@
 import { getJSON, isServiceBusyError, postJSON } from './api.js';
+import { operationRunningLabel } from './service-operations.js';
 import { money, state } from './core.js';
 import { compactNumber, formatBytes } from './formatters.js';
 
@@ -142,10 +143,7 @@ function applyServiceActivity(activity) {
   if (!button) return;
   button.disabled = Boolean(serviceActivity.running);
   if (serviceActivity.running) {
-    const label = serviceActivity.operation === 'cleanup'
-      ? 'Cleanup is running'
-      : (serviceActivity.operation === 'cost_recalculation' ? 'Cost recalculation is running' : 'Analysis is running');
-    setAnalyzeButtonState('blocked', label);
+    setAnalyzeButtonState('blocked', operationRunningLabel(serviceActivity.operation));
   } else if (button.dataset.analyzeState === 'blocked') {
     setAnalyzeButtonState('idle', 'Analyze');
   }
@@ -252,7 +250,7 @@ async function rebuildAndRefresh() {
         request.operationId = String((err || {}).operation_id || '');
         return await observeActiveAnalysis(request, started);
       } else {
-        finishAnalyzeStatus(`${String((err || {}).operation || 'service')} is busy`, 5000);
+        finishAnalyzeStatus(operationRunningLabel((err || {}).operation), 5000);
         showQueryError('Another service operation is already running');
       }
       return false;

@@ -28,7 +28,7 @@ import { createPager } from './components/pager.js';
 import { createListDetailView } from './components/list-detail-view.js';
 
 export function createOverviewRenderers({
-  params,
+  detailRoutes,
   requestListPage,
   getCachedJSON,
   peekCachedJSON,
@@ -207,12 +207,6 @@ function renderSessionDetail(data) {
   `;
 }
 
-function sessionDetailPath(sessionId) {
-  const q = params();
-  q.set('selected_session_id', sessionId);
-  return '/api/session-detail?' + q;
-}
-
 function commitSessionRow(row, detail) {
   state.selectedSession = row.dataset.sessionId || '';
   const label = row.dataset.sessionLabel || compactSessionId(state.selectedSession) || '(unknown)';
@@ -227,7 +221,7 @@ const sessionDetailView = createListDetailView({
   detailId: 'session-detail',
   statusId: 'session-detail-status',
   keyForRow: row => row.dataset.sessionId || '',
-  pathForRow: row => sessionDetailPath(row.dataset.sessionId || ''),
+  pathForRow: row => detailRoutes.session(row.dataset.sessionId || ''),
   nextRequestSequence: () => ++state.sessionSeq,
   isCurrentRequest: sequence => sequence === state.sessionSeq,
   commit: commitSessionRow,
@@ -268,12 +262,6 @@ function renderToolDetail(data) {
   `;
 }
 
-function toolDetailPath(toolName) {
-  const q = params();
-  q.set('tool_name', toolName);
-  return '/api/tool?' + q;
-}
-
 function commitToolRow(row, detail) {
   const toolName = row.dataset.tool || '';
   state.selectedTool = toolName;
@@ -289,7 +277,7 @@ const toolDetailView = createListDetailView({
   detailId: 'tool-detail',
   statusId: 'tool-detail-status',
   keyForRow: row => row.dataset.tool || '',
-  pathForRow: row => toolDetailPath(row.dataset.tool || ''),
+  pathForRow: row => detailRoutes.tool(row.dataset.tool || ''),
   nextRequestSequence: () => ++state.toolSeq,
   isCurrentRequest: sequence => sequence === state.toolSeq,
   commit: commitToolRow,
@@ -338,12 +326,6 @@ function renderSubagentDetail(data) {
   `;
 }
 
-function subagentDetailPath(confidence) {
-  const q = params();
-  q.set('confidence', confidence);
-  return '/api/subagent?' + q;
-}
-
 function commitSubagentRow(row, detail) {
   const confidence = row.dataset.confidence || '';
   state.selectedSubagentConfidence = confidence;
@@ -358,7 +340,7 @@ const subagentDetailView = createListDetailView({
   detailId: 'subagent-mix',
   statusId: 'subagent-detail-status',
   keyForRow: row => row.dataset.confidence || '',
-  pathForRow: row => subagentDetailPath(row.dataset.confidence || ''),
+  pathForRow: row => detailRoutes.subagent(row.dataset.confidence || ''),
   nextRequestSequence: () => ++state.subagentSeq,
   isCurrentRequest: sequence => sequence === state.subagentSeq,
   commit: commitSubagentRow,

@@ -10,12 +10,12 @@ import os
 import pathlib
 import re
 import threading
-import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
 
+import atomic_io
 import service_paths
 
 
@@ -332,19 +332,8 @@ def write_custom_rates(
     payload = _canonical_payload(rates, deleted_builtin_rates)
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     target.parent.chmod(0o700)
-    temporary = target.with_name(f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, target)
-        target.chmod(0o600)
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    atomic_io.write_text_owner_only(target, text)
     return _digest(payload)
 
 

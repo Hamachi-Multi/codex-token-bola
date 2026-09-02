@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
-import os
 import pathlib
 import shlex
 import sys
-import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -17,6 +14,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import service_paths
+import atomic_io
 
 
 @dataclass(frozen=True)
@@ -119,21 +117,7 @@ def hooks_json_status(codex_dir: pathlib.Path) -> dict[str, object]:
 
 
 def write_text_atomic_owner_only(path: pathlib.Path, text: str, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        tmp.chmod(mode)
-        tmp.replace(path)
-        path.chmod(mode)
-    except Exception:
-        with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()
-        raise
+    atomic_io.write_text_owner_only(path, text, mode)
 
 
 def merge_hooks_json_registration(codex_dir: pathlib.Path) -> dict[str, object]:
@@ -276,7 +260,7 @@ def run_install_hook(
             paths = requested_paths
     except Exception:
         if hooks_snapshot is None:
-            hooks_path.unlink(missing_ok=True)
+            atomic_io.unlink_durable(hooks_path)
         else:
             write_text_atomic_owner_only(hooks_path, hooks_snapshot.decode("utf-8"), 0o600)
         raise

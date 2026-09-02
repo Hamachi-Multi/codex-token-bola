@@ -1,27 +1,4 @@
-export async function getJSON(path) {
-  const res = await fetch(path);
-  const text = await res.text();
-  let parsed = {};
-  try {
-    parsed = text ? JSON.parse(text) : {};
-  } catch {
-    parsed = { error: text };
-  }
-  if (!res.ok) {
-    const error = new Error(parsed.message || parsed.error || text || res.statusText);
-    error.status = res.status;
-    error.code = parsed.error || '';
-    throw error;
-  }
-  return parsed;
-}
-
-export async function postJSON(path, body = null) {
-  const init = {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body === null ? {} : body),
-  };
+async function requestJSON(path, init) {
   const res = await fetch(path, init);
   const text = await res.text();
   let data = {};
@@ -38,6 +15,19 @@ export async function postJSON(path, body = null) {
     throw error;
   }
   return data;
+}
+
+export async function getJSON(path) {
+  return requestJSON(path);
+}
+
+export async function postJSON(path, body = null) {
+  const init = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body === null ? {} : body),
+  };
+  return requestJSON(path, init);
 }
 
 export function isServiceBusyError(err) {

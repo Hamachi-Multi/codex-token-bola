@@ -35,12 +35,41 @@ class RuntimeCommand(str, Enum):
 
 @dataclass(frozen=True)
 class ProcessResult:
-    command: RuntimeCommand
+    command: RuntimeCommand | str
     exit_code: int
     payload: dict[str, object] | None = None
     stdout: str = ""
     stderr: str = ""
     parse_error: str | None = None
+
+
+def process_result_from_output(
+    command: RuntimeCommand | str,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+) -> ProcessResult:
+    payload, parse_error = parse_last_json_object(stdout)
+    return ProcessResult(
+        command=command,
+        exit_code=exit_code,
+        payload=payload,
+        stdout=stdout,
+        stderr=stderr,
+        parse_error=parse_error,
+    )
+
+
+def required_json_contract_error(result: ProcessResult, *, operation: str) -> dict[str, object] | None:
+    if result.payload is not None and result.parse_error is None:
+        return None
+    return {
+        "error": "child_output_contract_failed",
+        "operation": operation,
+        "parse_error": result.parse_error or "json_object_missing",
+        "returncode": result.exit_code,
+        "result_unknown": True,
+    }
 
 
 class RuntimeCommandRunner(Protocol):
@@ -118,14 +147,11 @@ class SubprocessRuntimeCommandRunner:
             capture_output=True,
             pass_fds=pass_fds,
         )
-        payload, parse_error = parse_last_json_object(completed.stdout)
-        return ProcessResult(
-            command=command,
-            exit_code=completed.returncode,
-            payload=payload,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-            parse_error=parse_error,
+        return process_result_from_output(
+            command,
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
         )
 
     def replace(

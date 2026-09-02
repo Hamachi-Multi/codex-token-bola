@@ -19,10 +19,11 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import raw_segments
+import atomic_io
 import retention_pruned_store
 import service_lock
 import service_paths
-from runtime_command_runner import ProcessResult, RuntimeCommand
+from runtime_command_runner import ProcessResult, RuntimeCommand, required_json_contract_error
 
 HOOK_RECOVERY_RECORD_TYPES = frozenset({"turn_start", "turn_stop_missing_start"})
 
@@ -68,14 +69,7 @@ class PathsSetDependencies:
 class MigrationDependencies:
     run_command: Callable[[RuntimeCommand, list[str], dict[str, str]], ProcessResult]
     resolve_physical_deletes: Callable[[pathlib.Path], dict[str, Any]]
-    preview_migration: Callable[[pathlib.Path, pathlib.Path, dict[str, object] | None], dict[str, object]] | None = None
-    apply_migration: (
-        Callable[
-            [pathlib.Path, pathlib.Path, dict[str, object] | None],
-            tuple[int, dict[str, object]],
-        ]
-        | None
-    ) = None
+    recover_retention_cleanup: Callable[[pathlib.Path], dict[str, Any]]
 
 
 def sha256_file(path: pathlib.Path) -> str | None:
@@ -90,21 +84,7 @@ def sha256_file(path: pathlib.Path) -> str | None:
 
 
 def write_text_atomic_owner_only(path: pathlib.Path, text: str, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.chmod(mode)
-        temporary.replace(path)
-        path.chmod(mode)
-    except Exception:
-        with contextlib.suppress(FileNotFoundError):
-            temporary.unlink()
-        raise
+    atomic_io.write_text_owner_only(path, text, mode)
 
 
 def runtime_env(codex_dir: pathlib.Path, output_dir: pathlib.Path) -> dict[str, str]:
@@ -118,11 +98,11 @@ def require_migration_process_result(
 ) -> dict[str, object]:
     payload = result.payload
     status = str(payload.get("status") or "") if payload is not None else ""
-    valid = result.parse_error is None and payload is not None and result.exit_code == 0
+    contract_error = required_json_contract_error(result, operation=result.command.value)
+    valid = contract_error is None and result.exit_code == 0
     if allow_degraded:
         valid = (valid and status == "healthy") or (
-            result.parse_error is None
-            and payload is not None
+            contract_error is None
             and result.exit_code == 1
             and status == "degraded"
         )
@@ -603,14 +583,49 @@ def raw_migration_sources(source: pathlib.Path, *, recover: bool = True) -> list
     return list(unique)
 
 
-def read_migration_pruned_turn_state(root: pathlib.Path) -> dict[str, Any]:
+def retention_pruned_pending_payload(
+    roots: dict[pathlib.Path, list[dict[str, Any]]],
+) -> dict[str, object]:
+    pending = [
+        {
+            "output_dir": str(root),
+            "job_ids": sorted({str(row.get("job_id") or "") for row in rows if str(row.get("job_id") or "")}),
+            "rows": len(rows),
+        }
+        for root, rows in sorted(roots.items(), key=lambda item: str(item[0]))
+        if rows
+    ]
+    return {
+        "status": "blocked",
+        "migrated": False,
+        "error": "retention_pruned_state_pending",
+        "pending": pending,
+        "retryable": True,
+    }
+
+
+def read_migration_pruned_turn_state(
+    root: pathlib.Path,
+    *,
+    allowed_pending_job_ids: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     try:
-        rows = retention_pruned_store.snapshot_rows(root)
+        legacy_pending_rows = retention_pruned_store.snapshot_legacy_pending_rows(root)
+        rows = {} if legacy_pending_rows else retention_pruned_store.snapshot_rows(root)
     except retention_pruned_store.RetentionPrunedStoreError as exc:
         raise service_paths.ConfigurationError(f"invalid retention pruned turn state at {root}: {exc}") from exc
+    blocked_pending_by_id: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in [*rows.values(), *legacy_pending_rows]:
+        job_id = str(row.get("job_id") or "")
+        if str(row.get("state") or "") != "pending" or job_id in allowed_pending_job_ids:
+            continue
+        identity = (str(row.get("session_id") or ""), str(row.get("turn_id") or ""), job_id)
+        blocked_pending_by_id[identity] = row
+    blocked_pending = list(blocked_pending_by_id.values())
     return {
         "rows": rows,
         "has_pending": any(str(row.get("state") or "") == "pending" for row in rows.values()),
+        "blocked_pending": blocked_pending,
     }
 
 
@@ -633,9 +648,25 @@ def retention_pruned_conflict_payload(
     }
 
 
-def plan_retention_pruned_turn_merge(source: pathlib.Path, destination: pathlib.Path) -> dict[str, Any]:
+def plan_retention_pruned_turn_merge(
+    source: pathlib.Path,
+    destination: pathlib.Path,
+    *,
+    transition_id: str | None = None,
+) -> dict[str, Any]:
+    migration_job_id = f"migration:{transition_id}" if transition_id else None
     source_state = read_migration_pruned_turn_state(source)
-    destination_state = read_migration_pruned_turn_state(destination)
+    destination_state = read_migration_pruned_turn_state(
+        destination,
+        allowed_pending_job_ids=frozenset({migration_job_id}) if migration_job_id else frozenset(),
+    )
+    blocked = {
+        root: state["blocked_pending"]
+        for root, state in ((source, source_state), (destination, destination_state))
+        if state["blocked_pending"]
+    }
+    if blocked:
+        raise PathMigrationBlocked(retention_pruned_pending_payload(blocked))
     source_rows = source_state["rows"]
     destination_rows = destination_state["rows"]
     conflicts = sorted(
@@ -664,14 +695,14 @@ def plan_retention_pruned_turn_merge(source: pathlib.Path, destination: pathlib.
     }
 
 
-def stage_migration_pruned_turn_state(destination: pathlib.Path, merge: dict[str, Any]) -> str | None:
+def stage_migration_pruned_turn_state(destination: pathlib.Path, merge: dict[str, Any], *, transition_id: str) -> str | None:
     if not merge.get("changed"):
         return None
     try:
         return retention_pruned_store.stage_rows(
             destination,
             merge.get("rows") or [],
-            job_id=f"migration:{uuid.uuid4().hex}",
+            job_id=f"migration:{transition_id}",
         )
     except retention_pruned_store.RetentionPrunedStoreError as exc:
         raise service_paths.ConfigurationError(f"cannot stage retention pruned turn migration: {exc}") from exc
@@ -690,10 +721,21 @@ def output_migration_preview(
     transition: service_paths.PathTransition | dict[str, object] | None,
 ) -> dict[str, object]:
     validate_migration_roots(source, destination)
+    typed_transition = (
+        transition
+        if isinstance(transition, service_paths.PathTransition)
+        else service_paths.PathTransition.from_payload(transition)
+        if transition is not None
+        else None
+    )
     files = managed_content_files(source) if source != destination else []
     raw_sources = raw_migration_sources(source) if source != destination else []
     retention_pruned_turns = (
-        plan_retention_pruned_turn_merge(source, destination)["summary"]
+        plan_retention_pruned_turn_merge(
+            source,
+            destination,
+            transition_id=typed_transition.transition_id if typed_transition is not None else None,
+        )["summary"]
         if source != destination
         else {"source_rows": 0, "destination_rows": 0, "merged_rows": 0, "deduplicated_rows": 0}
     )
@@ -826,29 +868,8 @@ def apply_output_migration(
         if transition is not None
         else None
     )
-    if typed_transition is None:
-        transaction = service_paths.PathTransition(
-            transition_id=uuid.uuid4().hex,
-            source_output_dir=source,
-            active_output_dir=destination,
-            created_at_ns=time.time_ns(),
-            phase=service_paths.PathTransitionPhase.APPLYING,
-        )
-    else:
-        transaction = typed_transition.begin_migration()
-    transition_id = transaction.transition_id
-    with service_paths.acquire_path_lock(blocking=False):
-        recover_preparing_path_transition()
-        current_transition = service_paths.load_path_transition()
-        current_paths = service_paths.resolve_runtime_paths()
-        if current_paths.output_dir != destination:
-            raise service_paths.ConfigurationError(f"active output directory changed before migration: {current_paths.output_dir} != {destination}")
-        if typed_transition is not None:
-            if not current_transition or current_transition.transition_id != transition_id:
-                raise service_paths.ConfigurationError("output transition changed before migration")
-        elif current_transition is not None:
-            raise service_paths.ConfigurationError("a new output transition started before migration")
-        active_paths = current_paths
+    transition_id = typed_transition.transition_id if typed_transition is not None else uuid.uuid4().hex
+    transaction: service_paths.PathTransition | None = None
 
     roots = sorted({source.resolve(strict=False), destination.resolve(strict=False)}, key=str)
     locks: dict[pathlib.Path, service_lock.ServiceLock] = {}
@@ -861,8 +882,72 @@ def apply_output_migration(
         with contextlib.ExitStack() as stack:
             for root in roots:
                 locks[root] = stack.enter_context(service_lock.acquire_service_lock(reason="paths-migrate", output_dir=root))
+            with service_paths.acquire_path_lock():
+                recover_preparing_path_transition()
+                current_transition = service_paths.load_path_transition()
+                current_paths = service_paths.resolve_runtime_paths()
+                if current_paths.output_dir != destination:
+                    raise service_paths.ConfigurationError(
+                        f"active output directory changed before migration: {current_paths.output_dir} != {destination}"
+                    )
+                if typed_transition is not None:
+                    if (
+                        typed_transition.source_output_dir != source.resolve(strict=False)
+                        or typed_transition.active_output_dir != destination.resolve(strict=False)
+                    ):
+                        raise service_paths.ConfigurationError("requested output transition paths do not match migration roots")
+                    if not current_transition or current_transition.transition_id != transition_id:
+                        raise service_paths.ConfigurationError("output transition changed before migration")
+                    if (
+                        current_transition.source_output_dir != source.resolve(strict=False)
+                        or current_transition.active_output_dir != destination.resolve(strict=False)
+                    ):
+                        raise service_paths.ConfigurationError("persisted output transition paths do not match migration roots")
+                    if current_transition.phase is service_paths.PathTransitionPhase.APPLYING:
+                        current_transition = current_transition.mark_recovery_required()
+                        service_paths.write_path_transition(current_transition)
+                elif current_transition is not None:
+                    raise service_paths.ConfigurationError("a new output transition started before migration")
+                active_paths = current_paths
+            for root in roots:
+                try:
+                    dependencies.recover_retention_cleanup(root)
+                except Exception as exc:
+                    raise PathMigrationBlocked(
+                        {
+                            "status": "blocked",
+                            "migrated": False,
+                            "error": "retention_cleanup_recovery_failed",
+                            "output_dir": str(root),
+                            "message": str(exc),
+                            "retryable": True,
+                        }
+                    ) from exc
             dependencies.resolve_physical_deletes(source)
-            retention_pruned_turns = plan_retention_pruned_turn_merge(source, destination)
+            preview = output_migration_preview(source, destination, typed_transition)
+            if source == destination or int(preview["source_file_count"]) == 0:
+                if typed_transition is not None:
+                    with service_paths.acquire_path_lock():
+                        current_transition = service_paths.load_path_transition()
+                        current_paths = service_paths.resolve_runtime_paths()
+                        if not current_transition or current_transition.transition_id != transition_id:
+                            raise service_paths.ConfigurationError("output transition changed before migration cleanup")
+                        if current_paths.output_dir != destination:
+                            raise service_paths.ConfigurationError("active output directory changed before migration cleanup")
+                        service_paths.clear_path_transition()
+                return 0, {**preview, "status": "noop", "migrated": False, "dry_run": False}
+            if preview["source_evidence_incomplete"]:
+                return 2, {
+                    **preview,
+                    "status": "failed",
+                    "migrated": False,
+                    "error": "source_evidence_incomplete",
+                }
+            retention_pruned_turns = plan_retention_pruned_turn_merge(
+                source,
+                destination,
+                transition_id=transition_id,
+            )
             with service_paths.acquire_path_lock():
                 current_transition = service_paths.load_path_transition()
                 current_paths = service_paths.resolve_runtime_paths()
@@ -871,8 +956,22 @@ def apply_output_migration(
                 if typed_transition is not None:
                     if not current_transition or current_transition.transition_id != transition_id:
                         raise service_paths.ConfigurationError("output transition changed before migration")
+                    if (
+                        current_transition.source_output_dir != source.resolve(strict=False)
+                        or current_transition.active_output_dir != destination.resolve(strict=False)
+                    ):
+                        raise service_paths.ConfigurationError("persisted output transition paths do not match migration roots")
+                    transaction = current_transition.begin_migration()
                 elif current_transition is not None:
                     raise service_paths.ConfigurationError("a new output transition started before migration")
+                else:
+                    transaction = service_paths.PathTransition(
+                        transition_id=transition_id,
+                        source_output_dir=source,
+                        active_output_dir=destination,
+                        created_at_ns=time.time_ns(),
+                        phase=service_paths.PathTransitionPhase.APPLYING,
+                    )
                 service_paths.write_path_transition(transaction)
                 applying_started = True
             handoff = handoff_hook_recovery_states(source, destination)
@@ -889,7 +988,11 @@ def apply_output_migration(
 
             imports = [import_raw_segment(path, destination) for path in raw_migration_sources(source, recover=False)]
             evidence = copy_migration_evidence(source, destination, transition_id)
-            staged_pruned_turns = stage_migration_pruned_turn_state(destination, retention_pruned_turns)
+            staged_pruned_turns = stage_migration_pruned_turn_state(
+                destination,
+                retention_pruned_turns,
+                transition_id=transition_id,
+            )
             destination_lock = locks[destination.resolve(strict=False)]
             destination_env = service_lock.child_lock_env(
                 runtime_env(active_paths.codex_dir, destination),
@@ -913,7 +1016,7 @@ def apply_output_migration(
                 pathlib.Path(source_path).unlink(missing_ok=True)
             remove_source_managed_data(source)
     except Exception:
-        if applying_started:
+        if applying_started and transaction is not None:
             transaction = transaction.mark_recovery_required()
             with service_paths.acquire_path_lock():
                 service_paths.write_path_transition(transaction)
@@ -942,40 +1045,28 @@ def run_paths_migrate(options: PathsMigrateOptions, dependencies: MigrationDepen
     with service_paths.acquire_path_lock(blocking=False):
         recover_preparing_path_transition()
         transition, source, destination = pending_output_migration()
+    if options.apply:
+        try:
+            code, result = apply_output_migration(source, destination, transition, dependencies)
+        except PathMigrationBlocked as exc:
+            return PathsResult(exit_code=2, payload=exc.payload())
+        return PathsResult(exit_code=code, payload=result)
     try:
-        preview_fn = dependencies.preview_migration or output_migration_preview
         preview_transition = transition.to_payload() if transition is not None else None
-        preview = preview_fn(source, destination, preview_transition)
+        preview = output_migration_preview(source, destination, preview_transition)
     except PathMigrationBlocked as exc:
         return PathsResult(exit_code=2, payload=exc.payload())
     if source == destination or preview["source_file_count"] == 0:
-        if options.apply and transition:
-            with service_paths.acquire_path_lock():
-                current = service_paths.load_path_transition()
-                if not current or current.transition_id != transition.transition_id:
-                    raise service_paths.ConfigurationError("output transition changed before migration cleanup")
-                if service_paths.resolve_runtime_paths().output_dir != destination:
-                    raise service_paths.ConfigurationError("active output directory changed before migration cleanup")
-                service_paths.clear_path_transition()
         return PathsResult(
             exit_code=0,
-            payload={**preview, "status": "noop", "migrated": False, "dry_run": not options.apply},
+            payload={**preview, "status": "noop", "migrated": False, "dry_run": True},
         )
     if preview["source_evidence_incomplete"]:
         return PathsResult(
             exit_code=2,
             payload={**preview, "status": "failed", "migrated": False, "error": "source_evidence_incomplete"},
         )
-    if not options.apply:
-        return PathsResult(
-            exit_code=0,
-            payload={**preview, "status": "preview", "migrated": False, "dry_run": True},
-        )
-    try:
-        if dependencies.apply_migration is None:
-            code, result = apply_output_migration(source, destination, transition, dependencies)
-        else:
-            code, result = dependencies.apply_migration(source, destination, transition.to_payload() if transition is not None else None)
-    except PathMigrationBlocked as exc:
-        return PathsResult(exit_code=2, payload=exc.payload())
-    return PathsResult(exit_code=code, payload=result)
+    return PathsResult(
+        exit_code=0,
+        payload={**preview, "status": "preview", "migrated": False, "dry_run": True},
+    )

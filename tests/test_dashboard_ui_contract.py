@@ -10,6 +10,33 @@ DASHBOARD_ASSET_BUNDLE = dashboard_asset_bundle()
 
 
 class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
+    def test_dashboard_shell_owns_preferences_theme_and_navigation(self) -> None:
+        app_source = (ROOT / "scripts" / "assets" / "dashboard" / "app.js").read_text(encoding="utf-8")
+        shell_source = (ROOT / "scripts" / "assets" / "dashboard" / "app-shell.js").read_text(encoding="utf-8")
+
+        self.assertIn("import { createDashboardShell } from './app-shell.js';", app_source)
+        self.assertIn("shellController = createDashboardShell({", app_source)
+        self.assertIn("shellController.initialize();", app_source)
+        for implementation_detail in ("localStorage.setItem", "function applyThemeMode(", "function setView("):
+            self.assertNotIn(implementation_detail, app_source)
+            self.assertIn(implementation_detail, shell_source)
+
+    def test_turns_controller_owns_turn_sorting_paging_selection_and_rendering(self) -> None:
+        app_source = (ROOT / "scripts" / "assets" / "dashboard" / "app.js").read_text(encoding="utf-8")
+        turns_source = (ROOT / "scripts" / "assets" / "dashboard" / "turns-controller.js").read_text(encoding="utf-8")
+
+        self.assertIn("import { createTurnsController } from './turns-controller.js';", app_source)
+        self.assertIn("turnsController = createTurnsController({", app_source)
+        self.assertIn("await turnsController.commitDashboardLoad(turns, {", app_source)
+        for implementation_detail in (
+            "function setSort(",
+            "function renderPage(",
+            "async function loadPage(",
+            "const detailView = createListDetailView({",
+        ):
+            self.assertNotIn(implementation_detail, app_source)
+            self.assertIn(implementation_detail, turns_source)
+
     def test_dashboard_frontend_is_loaded_from_assets(self) -> None:
         serve = load_module("serve_dashboard_assets_test", ROOT / "scripts" / "serve_dashboard.py")
 
@@ -58,9 +85,9 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("window.matchMedia('(prefers-color-scheme: dark)').matches", serve.HTML)
         self.assertIn("document.documentElement.dataset.theme = storedTheme === 'system' ? systemTheme : storedTheme;", serve.HTML)
         self.assertIn("function applyThemeMode(mode, {transition = false, suppressTransitions = false} = {})", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("commitThemeMode(normalized, {suppressTransitions: suppressTransitions || (transition && document.documentElement.dataset.theme !== resolved)});", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("applyThemeMode(resolveInitialThemeMode(settings), {suppressTransitions: true});", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("function resolveInitialThemeMode(settings = {})", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("suppressTransitions: suppressTransitions || (transition && document.documentElement.dataset.theme !== resolved)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("applyThemeMode(normalizeThemeMode(settings.themeMode), {suppressTransitions: true});", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("function normalizeThemeMode(value)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function bindSystemThemePreference()", DASHBOARD_ASSET_BUNDLE)
 
     def test_session_labels_switch_between_project_and_thread_modes(self) -> None:
@@ -142,7 +169,8 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("window.addEventListener('focus', refresh);", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("serviceActivityController.subscribe(applyServiceActivity);", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("serviceActivityController.subscribe(costRatesController.applyServiceActivity);", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("status.operation === 'cost_recalculation' ? 'Recalculate' : 'Analyze'", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("const action = operationActionLabel(status.operation);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("cost_recalculation: { action: 'Recalculate', running: 'Cost recalculation' }", DASHBOARD_ASSET_BUNDLE)
 
     def test_theme_mode_control_is_available_in_settings(self) -> None:
         self.assertIn('data-view-target="settings"', DASHBOARD_ASSET_BUNDLE)
@@ -150,11 +178,11 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn('data-theme-mode="light"', DASHBOARD_ASSET_BUNDLE)
         self.assertIn('data-theme-mode="dark"', DASHBOARD_ASSET_BUNDLE)
         self.assertIn("themeMode: 'system'", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("payload.themeMode = state.themeMode;", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("themeMode: state.themeMode,", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("root.dataset.theme = normalized === 'system' ? systemThemeMode() : normalized;", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("applyThemeMode(resolveInitialThemeMode(settings), {suppressTransitions: true});", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("applyThemeMode(normalizeThemeMode(settings.themeMode), {suppressTransitions: true});", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("bindSystemThemePreference();", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("applyThemeModeAndSave(button.dataset.themeMode);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("button.addEventListener('click', () => applyThemeModeAndSave(button.dataset.themeMode));", DASHBOARD_ASSET_BUNDLE)
         self.assertIn(':root[data-theme="dark"]', DASHBOARD_ASSET_BUNDLE)
         self.assertIn("@media (prefers-color-scheme: dark)", DASHBOARD_ASSET_BUNDLE)
 
@@ -284,7 +312,7 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("const sortAttribute = sortState ? sortState.attribute : 'data-turn-sort';", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function compactDateTime(value)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function compactDate(value)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("const promptAt = r.started_at || r.captured_at || '';", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("const promptAt = row.started_at || row.captured_at || '';", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("${esc(compactDateTime(promptAt))}", DASHBOARD_ASSET_BUNDLE)
         self.assertIn('class="datetime-cell"', DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn('class="date-cell"', DASHBOARD_ASSET_BUNDLE)
@@ -323,9 +351,10 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("#turn-list th:nth-child(3), #turn-list td:nth-child(3) { width: 43%; }", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("#turn-list th:nth-child(4), #turn-list td:nth-child(4) { width: 9%; }", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("#turn-list th:nth-child(5), #turn-list td:nth-child(5) { width: 11%; }", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("const creditValue = costAvailable ? compactNumberSpan(r.credits, 'money')", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("const creditValue = costAvailable ? compactNumberSpan(row.credits, 'money')", DASHBOARD_ASSET_BUNDLE)
         self.assertIn('<td class="num">${creditValue}</td>', DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("<td class=\"num\">${compactNumberSpan(r.raw)}</td>", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("const rawValue = tokenAvailable ? compactNumberSpan(row.raw)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn('<td class="num">${rawValue}</td>', DASHBOARD_ASSET_BUNDLE)
     def test_tool_prompt_navigation_uses_modal_not_turns_view(self) -> None:
         self.assertIn('id="turn-modal"', DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function openTurnModalFromToolLink", DASHBOARD_ASSET_BUNDLE)
@@ -382,7 +411,7 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("export function restoreReplacedControlFocus(trigger, selector)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("if (![document.body, document.documentElement].includes(document.activeElement)) return false;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("setListSort(key, button.dataset.listSort, button);", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("setTurnSort(button.dataset.turnSort, button);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("setSort(button.dataset.turnSort, button);", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function listTableSortState(kind)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("q.set('session_sort', state.listSorts.projects.key);", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("q.set('tool_sort', state.listSorts.tools.key);", DASHBOARD_ASSET_BUNDLE)
@@ -395,14 +424,14 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn('<div class="list-footer"><div class="pager" id="projects-pager"></div></div>', DASHBOARD_ASSET_BUNDLE)
         self.assertIn('<div class="list-footer"><div class="pager" id="tool-output-pager"></div></div>', DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn('id="subagent-rollups-pager"', DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("q.set('sessions_page', String(state.listPages.projects || 1));", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("q.set('tools_page', String(state.listPages.tools || 1));", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("query.set('sessions_page', String(state.listPages.projects || 1));", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("query.set('tools_page', String(state.listPages.tools || 1));", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function listPayloadRows(payload)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function listIsServerPaged(payload)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function paginateListRows(key, payload)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function renderListPager(key, total)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("renderSessionList(sessions, prepared);", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("renderToolList(tools, prepared);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("render: renderSessionList,", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("render: renderToolList,", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("renderSubagentList((subagents || {}).rows || [], prepared)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("renderListPager('projects', payload)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("renderListPager('tools', payload)", DASHBOARD_ASSET_BUNDLE)
@@ -411,7 +440,7 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("resetListPages();", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("export function createPager({ rootId, onPageChange, previousButtonId = '', nextButtonId = '' })", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("requestListPage(key, page);", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("onPageChange: page => safeLoadTurnPage(page)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("onPageChange: page => safeLoadPage(page)", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("state.listPages[key] = nextPage;\n      if (serverPaged)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn(".pager button {\n      min-width: 56px;\n      height: 26px;\n      padding: 0 10px;\n      border-color: var(--border-strong);\n      background: var(--surface-2);", DASHBOARD_ASSET_BUNDLE)
         self.assertIn(".pager .page-status {\n      inline-size: 92px;", DASHBOARD_ASSET_BUNDLE)
@@ -420,7 +449,7 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn("not-allowed", DASHBOARD_ASSET_BUNDLE)
     def test_first_column_pagination_reselects_visible_detail_row(self) -> None:
 
-        self.assertGreaterEqual(DASHBOARD_ASSET_BUNDLE.count("DetailView.activateRendered({"), 4)
+        self.assertGreaterEqual(DASHBOARD_ASSET_BUNDLE.count(".activateRendered({"), 4)
         self.assertIn("const target = rows.find(isSelected) || rows[0] || null;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("setPanelContent(detailId, emptyMessage, 'empty');", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("setPanelContent('subagent-detail',", DASHBOARD_ASSET_BUNDLE)
@@ -441,7 +470,7 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("if (coldStart) setLoading();", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function prepareAnalyticsReload()", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("invalidateAnalyticsQueries();\n  resetAllPages();\n  setLoading();", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("prefetchNextPage(turns, turnsPath", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("prefetchNextPage(turns, path", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("rollupCache:", DASHBOARD_ASSET_BUNDLE)
 
     def test_session_detail_ui_uses_session_identifiers(self) -> None:
@@ -450,7 +479,8 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn('id="session-detail"', DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function renderSessionDetail(data)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("setPanelContent('session-detail', renderSessionDetail(detail))", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("return prepareDetail(key, sessionDetailPath(key));", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("return prepareDetail(key, detailRoutes.session(key));", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("session: sessionId => path('/api/session-detail', 'selected_session_id', sessionId)", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("project-detail", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("renderProjectDetail", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("/api/project-detail", DASHBOARD_ASSET_BUNDLE)
