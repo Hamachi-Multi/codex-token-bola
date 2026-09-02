@@ -122,11 +122,11 @@ function refObject(payload, label) {
   return object;
 }
 
-async function remoteTagTarget(repo, tag) {
-  const ref = await apiRequest(repo, `/git/ref/tags/${encodeURIComponent(tag)}`);
+async function remoteTagTarget(repo, tag, request = apiRequest) {
+  const ref = await request(repo, `/git/ref/tags/${encodeURIComponent(tag)}`);
   const object = refObject(ref, tag);
   if (object.type !== 'tag') return object.sha;
-  const annotated = await apiRequest(repo, `/git/tags/${object.sha}`);
+  const annotated = await request(repo, `/git/tags/${object.sha}`);
   if (annotated?.object?.type !== 'commit' || !SHA_RE.test(annotated.object.sha || '')) {
     fail(`annotated tag ${tag} must point directly to a commit`);
   }
@@ -141,25 +141,21 @@ function releaseMatches(release, {tag, notes}) {
     && release?.prerelease === false;
 }
 
-async function main() {
-  const args = parseArgs(process.argv.slice(2));
-  const cwd = path.resolve(requireValue(args, 'repo-root'));
-  const repo = requireValue(args, 'repo', REPO_RE);
-  const productSha = requireValue(args, 'product-sha', SHA_RE);
-  const releaseSha = requireValue(args, 'release-sha', SHA_RE);
-  const tag = requireValue(args, 'tag', TAG_RE);
-  const releaseDate = requireValue(args, 'release-date', DATE_RE);
-  const output = path.resolve(requireValue(args, 'output'));
+export async function recoverOrphanRelease(options, dependencies = {}) {
+  const {cwd, repo, productSha, releaseSha, tag, releaseDate} = options;
+  const gitCommand = dependencies.git || git;
+  const request = dependencies.apiRequest || apiRequest;
+  const readCommitList = dependencies.readCommits || readCommits;
 
-  if (git(cwd, ['rev-parse', 'HEAD']) !== releaseSha) fail('checked out HEAD does not match release SHA');
-  if (git(cwd, ['rev-parse', `${tag}^{commit}`]) !== productSha) fail('local tag does not point to product SHA');
+  if (gitCommand(cwd, ['rev-parse', 'HEAD']) !== releaseSha) fail('checked out HEAD does not match release SHA');
+  if (gitCommand(cwd, ['rev-parse', `${tag}^{commit}`]) !== productSha) fail('local tag does not point to product SHA');
 
-  const mainRef = await apiRequest(repo, '/git/ref/heads/main');
+  const mainRef = await request(repo, '/git/ref/heads/main');
   if (refObject(mainRef, 'main').sha !== releaseSha) fail('public main moved from release SHA');
-  if (await remoteTagTarget(repo, tag) !== productSha) fail('remote tag does not point to product SHA');
+  if (await remoteTagTarget(repo, tag, request) !== productSha) fail('remote tag does not point to product SHA');
 
   const targetVersion = versionTuple(tag);
-  const reachableTags = git(cwd, ['tag', '--merged', productSha, '--list', 'v*'])
+  const reachableTags = gitCommand(cwd, ['tag', '--merged', productSha, '--list', 'v*'])
     .split('\n')
     .filter(Boolean)
     .filter((candidate) => TAG_RE.test(candidate));
@@ -170,12 +166,16 @@ async function main() {
   const baselineTag = previousTags[0];
   const baselineVersion = versionTuple(baselineTag);
 
-  const config = JSON.parse(fs.readFileSync(path.join(cwd, '.releaserc.json'), 'utf8'));
-  const analyzerPath = pathToFileURL(path.join(cwd, 'node_modules/@semantic-release/commit-analyzer/index.js'));
-  const notesPath = pathToFileURL(path.join(cwd, 'node_modules/@semantic-release/release-notes-generator/index.js'));
-  const {analyzeCommits} = await import(analyzerPath);
-  const {generateNotes} = await import(notesPath);
-  const commits = readCommits(cwd, baselineTag, productSha);
+  const config = dependencies.config || JSON.parse(fs.readFileSync(path.join(cwd, '.releaserc.json'), 'utf8'));
+  let analyzeCommits = dependencies.analyzeCommits;
+  let generateNotes = dependencies.generateNotes;
+  if (!analyzeCommits || !generateNotes) {
+    const analyzerPath = pathToFileURL(path.join(cwd, 'node_modules/@semantic-release/commit-analyzer/index.js'));
+    const notesPath = pathToFileURL(path.join(cwd, 'node_modules/@semantic-release/release-notes-generator/index.js'));
+    ({analyzeCommits} = await import(analyzerPath));
+    ({generateNotes} = await import(notesPath));
+  }
+  const commits = readCommitList(cwd, baselineTag, productSha);
   const context = {
     cwd,
     env: {},
@@ -183,7 +183,7 @@ async function main() {
     lastRelease: {
       version: baselineTag.slice(1),
       gitTag: baselineTag,
-      gitHead: git(cwd, ['rev-list', '-n', '1', baselineTag]),
+      gitHead: gitCommand(cwd, ['rev-list', '-n', '1', baselineTag]),
     },
     nextRelease: {
       version: tag.slice(1),
@@ -218,10 +218,10 @@ async function main() {
   );
   if (!notes) fail('generated release notes are empty');
 
-  let release = await apiRequest(repo, `/releases/tags/${encodeURIComponent(tag)}`, {allowNotFound: true});
+  let release = await request(repo, `/releases/tags/${encodeURIComponent(tag)}`, {allowNotFound: true});
   let created = false;
   if (release === null) {
-    release = await apiRequest(repo, '/releases', {
+    release = await request(repo, '/releases', {
       method: 'POST',
       body: {
         tag_name: tag,
@@ -236,9 +236,9 @@ async function main() {
     created = true;
   }
   if (!releaseMatches(release, {tag, notes})) fail('GitHub Release metadata conflicts with repair output');
-  if (await remoteTagTarget(repo, tag) !== productSha) fail('release tag target changed during repair');
+  if (await remoteTagTarget(repo, tag, request) !== productSha) fail('release tag target changed during repair');
 
-  const result = {
+  return {
     ok: true,
     created,
     tag,
@@ -250,11 +250,25 @@ async function main() {
     notes_digest: `sha256:${crypto.createHash('sha256').update(notes).digest('hex')}`,
     github_release_url: release.html_url,
   };
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const cwd = path.resolve(requireValue(args, 'repo-root'));
+  const repo = requireValue(args, 'repo', REPO_RE);
+  const productSha = requireValue(args, 'product-sha', SHA_RE);
+  const releaseSha = requireValue(args, 'release-sha', SHA_RE);
+  const tag = requireValue(args, 'tag', TAG_RE);
+  const releaseDate = requireValue(args, 'release-date', DATE_RE);
+  const output = path.resolve(requireValue(args, 'output'));
+  const result = await recoverOrphanRelease({cwd, repo, productSha, releaseSha, tag, releaseDate});
   fs.writeFileSync(output, `${JSON.stringify(result, null, 2)}\n`, 'utf8');
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error.message || error}\n`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+  main().catch((error) => {
+    process.stderr.write(`${error.message || error}\n`);
+    process.exitCode = 1;
+  });
+}
