@@ -209,8 +209,26 @@ def check_tools_and_subagents(page, base_url: str) -> None:
     )
     assert_true(len(set(tool_head_heights)) == 1, f"tool panel headers are misaligned: {tool_head_heights}")
     if page.locator("#tool-output tr[data-tool]").count() > 0:
+        selected_tool = page.locator("#tool-output tr[data-tool]").first.get_attribute("data-tool") or ""
         page.locator("#tool-output tr[data-tool]").first.click()
-        page.wait_for_selector("#tool-detail table", timeout=10_000)
+        page.wait_for_function(
+            """
+            (toolName) => {
+              const distribution = document.querySelector('#tool-detail .tool-session-distribution');
+              const selected = document.querySelector(`#tool-output tr[data-tool="${CSS.escape(toolName)}"]`);
+              const renderedName = document.querySelector('#tool-detail .method-name')?.textContent?.trim() || '';
+              return Boolean(
+                selected
+                && !selected.hasAttribute('aria-busy')
+                && renderedName === toolName
+                && distribution
+                && distribution.clientWidth > 0
+              );
+            }
+            """,
+            arg=selected_tool,
+            timeout=10_000,
+        )
         tool_header_position = page.locator("#tool-detail th").first.evaluate("(el) => getComputedStyle(el).position")
         assert_true(tool_header_position != "sticky", f"tool detail header should scroll normally: {tool_header_position}")
         session_distribution_fit = page.locator("#tool-detail .tool-session-distribution").evaluate(

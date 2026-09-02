@@ -925,7 +925,7 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
 
     def test_analyzed_turns_metric_shows_compact_analyze_needed_indicator(self) -> None:
         self.assertNotIn('id="analysis-freshness"', DASHBOARD_ASSET_BUNDLE)
-        self.assertNotIn("analysis-freshness", DASHBOARD_ASSET_BUNDLE)
+        self.assertNotIn("function updateAnalysisFreshness(freshness)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function freshnessIndicator(freshness)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("dashboard.freshness", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("`${exactNumber(summary.turns || 0)} eligible · ${exactNumber(summary.unavailable_turns || 0)} unavailable`", DASHBOARD_ASSET_BUNDLE)
@@ -955,6 +955,20 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn("cursor: help;", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn(">Reanalyze</button>", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn(">Analyze needed</button>", DASHBOARD_ASSET_BUNDLE)
+
+    def test_mobile_detail_navigation_reuses_stacked_panels(self) -> None:
+        for detail_id in ("session-detail", "detail", "tool-detail", "subagent-mix"):
+            self.assertIn(f'data-mobile-detail-back="{detail_id}"', DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("window.matchMedia('(max-width: 720px)').matches", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("panel.scrollIntoView({ block: 'start' });", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("target.scrollIntoView({ block: 'center' });", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("focus({ preventScroll: true });", DASHBOARD_ASSET_BUNDLE)
+        self.assertNotIn("history.pushState", DASHBOARD_ASSET_BUNDLE)
+
+    def test_cleanup_and_settings_hide_analytics_toolbar_controls(self) -> None:
+        self.assertIn('body[data-active-view="cleanup"] .custom-filter-control', DASHBOARD_ASSET_BUNDLE)
+        self.assertIn('body[data-active-view="settings"] #rebuild', DASHBOARD_ASSET_BUNDLE)
+        self.assertIn('<button id="cleanup-refresh" class="primary" type="button">Refresh Preview</button>', DASHBOARD_ASSET_BUNDLE)
     def test_analyze_button_can_cancel_running_rebuild(self) -> None:
         self.assertIn("let analyzeRequest = null;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function isAnalyzeRunning()", DASHBOARD_ASSET_BUNDLE)

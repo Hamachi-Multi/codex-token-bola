@@ -101,10 +101,12 @@ class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
                 "Raw Current Segments",
                 "Pending Turn State",
                 "State Files",
+                "Migration Evidence",
             },
         )
         self.assertEqual(targets.by_label["Pending Turn State"], [pending])
         self.assertEqual(targets.by_label["State Files"], [service_state, hook_probe])
+        self.assertEqual(targets.by_label["Migration Evidence"], [base / "reports" / "migrations"])
         self.assertEqual(
             targets.retention_reset_by_label["Normalized Outputs"],
             [base / "normalized" / "prompt-usage.normalized.jsonl", base / "normalized" / "normalize-state.json"],

@@ -16,6 +16,8 @@ ISSUE_PRESENTATIONS: dict[str, IssuePresentation] = {
     "runtime_config_missing": IssuePresentation("Runtime configuration is missing", "bola install-hook"),
     "codex_dir_invalid": IssuePresentation("Codex directory is invalid"),
     "codex_cli_invalid": IssuePresentation("Codex CLI is unavailable or invalid"),
+    "output_dir_not_directory": IssuePresentation("Output path is not a directory"),
+    "output_dir_unwritable": IssuePresentation("Output directory is not writable"),
     "runtime_status_invalid": IssuePresentation("Runtime status could not be inspected"),
     "current_segment_state_invalid": IssuePresentation("Raw segment state is invalid"),
     "hooks_config_invalid": IssuePresentation("Codex hook configuration is invalid"),
@@ -152,7 +154,8 @@ def _check_lines(report: dict[str, object]) -> list[str]:
         lines.append(f"[WARN] Codex hooks: missing {', '.join(missing_hooks)}")
     else:
         lines.append(f"[OK] Codex hooks: {', '.join(sorted(str(name) for name in hooks))}")
-    lines.append(f"[{'OK' if output_dir.get('exists') else 'INFO'}] Output directory: {output_dir.get('path') or 'unknown'}")
+    output_status = "FAIL" if output_dir.get("is_directory") is False or output_dir.get("writable") is False else ("OK" if output_dir.get("exists") else "INFO")
+    lines.append(f"[{output_status}] Output directory: {output_dir.get('path') or 'unknown'}")
     analytics_status = "OK" if analytics_db.get("exists") else "INFO"
     analytics_note = f" ({_format_bytes(analytics_db.get('bytes'))})" if analytics_db.get("exists") else " (not built)"
     lines.append(f"[{analytics_status}] Analytics database: {analytics_db.get('path') or 'unknown'}{analytics_note}")

@@ -47,6 +47,10 @@ class CleanupTargetSet:
         self.retention_reset_by_label = retention_reset_by_label
 
 
+def migration_evidence_path(base: pathlib.Path) -> pathlib.Path:
+    return base / "reports" / "migrations"
+
+
 def _cleanup_target_set(base: pathlib.Path, db: pathlib.Path) -> CleanupTargetSet:
     state_dir = base / "state"
     pending_targets = pending_turn_state_paths(state_dir)
@@ -67,6 +71,7 @@ def _cleanup_target_set(base: pathlib.Path, db: pathlib.Path) -> CleanupTargetSe
         "Raw Current Segments": [base / "raw" / "current"],
         "Pending Turn State": pending_targets,
         "State Files": state_targets,
+        "Migration Evidence": [migration_evidence_path(base)],
     }
     return CleanupTargetSet(
         by_label=by_label,
@@ -136,6 +141,8 @@ def delete_all_logs(token_usage_root: pathlib.Path | str, db_path: pathlib.Path 
         with raw_segments.acquire_raw_segment_lock(base):
             for name in ("raw", "normalized", "analytics", "tmp", "bad"):
                 delete_path(base / name, name)
+
+            delete_path(migration_evidence_path(base), "migration_evidence")
 
             for pattern in ("prompt-usage*.jsonl", "hook-probe-events.jsonl"):
                 for path in sorted(base.glob(pattern)):

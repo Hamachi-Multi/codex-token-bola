@@ -134,6 +134,8 @@ class CliDoctorTests(CliTestCase):
             "runtime_config_missing",
             "codex_dir_invalid",
             "codex_cli_invalid",
+            "output_dir_not_directory",
+            "output_dir_unwritable",
             "runtime_status_invalid",
             "current_segment_state_invalid",
             "hooks_config_invalid",
@@ -169,6 +171,33 @@ class CliDoctorTests(CliTestCase):
         )
         self.assertIn("Future health signal (future_health_signal)", output)
         self.assertIn("Count: 7", output)
+
+    def test_doctor_rejects_output_path_that_is_not_a_directory(self) -> None:
+        cli = load_module("doctor_output_file_test", ROOT / "scripts" / "bola.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output = pathlib.Path(tmp_dir) / "output"
+            output.write_text("not a directory", encoding="utf-8")
+            status = cli.doctor_service.output_dir_status(output)
+            health = cli.doctor_service.doctor_health(
+                {"codex_dir": {"valid": True}, "codex_cli": {"valid": True}, "output_dir": status, "runtime": {}}
+            )
+
+        self.assertFalse(status["is_directory"])
+        self.assertEqual(health["status"], "failed")
+        self.assertIn("output_dir_not_directory", [issue["code"] for issue in health["issues"]])
+
+    def test_doctor_reports_write_probe_failure_without_leaving_probe(self) -> None:
+        cli = load_module("doctor_output_write_probe_test", ROOT / "scripts" / "bola.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output = pathlib.Path(tmp_dir) / "output"
+            output.mkdir()
+            with mock.patch.object(cli.doctor_service.os, "open", side_effect=PermissionError(13, "blocked")):
+                status = cli.doctor_service.output_dir_status(output)
+            probes = list(output.glob(".bola-doctor-write-probe-*"))
+
+        self.assertFalse(status["writable"])
+        self.assertEqual(status["write_probe_error"], {"type": "PermissionError", "errno": 13})
+        self.assertEqual(probes, [])
 
     def test_doctor_parser_exposes_explicit_json_mode(self) -> None:
         cli = load_module("doctor_json_parser_test", ROOT / "scripts" / "bola.py")
@@ -394,5 +423,4 @@ class CliDoctorTests(CliTestCase):
         self.assertFalse(report["codex_dir"]["valid"])
         self.assertEqual(report["codex_dir"]["reason"], "not_initialized")
         self.assertEqual(report["codex_cli"]["reason"], "not_found")
-
 

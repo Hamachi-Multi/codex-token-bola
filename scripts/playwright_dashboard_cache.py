@@ -213,6 +213,7 @@ def check_stale_failure_and_detail_failure_are_local(page, base_url: str) -> Non
           cache.clearAnalyticsQueryCache();
           window.__originalFetch = window.fetch;
           window.__failDetail = false;
+          window.__failToolDetail = false;
           window.__failPage = false;
           window.__failCurrentSort = false;
           window.__delayNextDashboardFailure = false;
@@ -258,6 +259,12 @@ def check_stale_failure_and_detail_failure_are_local(page, base_url: str) -> Non
             if (url.pathname === '/api/turn' && window.__failDetail) {
               return Promise.resolve(new Response(
                 JSON.stringify({error: 'detail failed'}),
+                {status: 500, headers: {'Content-Type': 'application/json'}}
+              ));
+            }
+            if (url.pathname === '/api/tool' && window.__failToolDetail) {
+              return Promise.resolve(new Response(
+                JSON.stringify({error: 'tool detail failed'}),
                 {status: 500, headers: {'Content-Type': 'application/json'}}
               ));
             }
@@ -356,6 +363,79 @@ def check_stale_failure_and_detail_failure_are_local(page, base_url: str) -> Non
     page.locator("#turn-list tr[data-turn]").first.click()
     page.wait_for_function(
         "() => document.querySelector('#turn-list tr.selected') !== null && document.querySelector('#detail-status')?.textContent !== 'error'",
+        timeout=10_000,
+    )
+
+    page.locator('button[data-view-target="tools"]').click()
+    page.wait_for_function("() => document.querySelectorAll('#tool-output tr[data-tool]').length >= 3", timeout=10_000)
+    page.wait_for_function(
+        """
+        () => document.querySelector('#tool-output tr.selected') !== null
+          && !document.querySelector('#tool-output tr.selected').hasAttribute('aria-busy')
+          && document.querySelector('#tool-detail-status').textContent !== 'error'
+        """,
+        timeout=10_000,
+    )
+    page.wait_for_function(
+        "async () => (await import('/assets/dashboard/query-cache.js')).analyticsQueryCache.stats().inFlight === 0",
+        timeout=10_000,
+    )
+    committed_tool = page.evaluate(
+        """
+        async () => {
+          const cache = await import('/assets/dashboard/query-cache.js');
+          cache.clearAnalyticsQueryCache();
+          const selected = document.querySelector('#tool-output tr.selected');
+          window.__failToolDetail = true;
+          return {
+            key: selected?.dataset.tool || '',
+            status: document.querySelector('#tool-detail-status').textContent,
+            detail: document.querySelector('#tool-detail').textContent,
+          };
+        }
+        """
+    )
+    failed_tool = page.evaluate(
+        """
+        () => {
+          const rows = [...document.querySelectorAll('#tool-output tr[data-tool]')]
+            .filter(row => row.dataset.tool !== document.querySelector('#tool-output tr.selected')?.dataset.tool);
+          rows[0].querySelector('.row-select-button').click();
+          rows[1].querySelector('.row-select-button').click();
+          return rows[0].dataset.tool;
+        }
+        """
+    )
+    page.wait_for_function(
+        """
+        () => !document.querySelector('#query-status').hidden
+          && document.querySelectorAll('#tool-output tr[aria-busy="true"]').length === 0
+        """,
+        timeout=10_000,
+    )
+    restored_tool = page.evaluate(
+        """
+        () => ({
+          key: document.querySelector('#tool-output tr.selected')?.dataset.tool || '',
+          status: document.querySelector('#tool-detail-status').textContent,
+          detail: document.querySelector('#tool-detail').textContent,
+        })
+        """
+    )
+    assert_true(
+        restored_tool == committed_tool,
+        f"rapid detail failures did not restore the committed tool: committed={committed_tool}, restored={restored_tool}",
+    )
+
+    page.evaluate("() => { window.__failToolDetail = false; }")
+    page.locator(f'#tool-output tr[data-tool="{failed_tool}"] .row-select-button').click()
+    page.wait_for_function(
+        """
+        (toolName) => document.querySelector('#tool-output tr.selected')?.dataset.tool === toolName
+          && !document.querySelector('#tool-output tr.selected').hasAttribute('aria-busy')
+          && document.querySelector('#query-status').hidden
+        """,
+        arg=failed_tool,
         timeout=10_000,
     )
     page.evaluate("() => { window.fetch = window.__originalFetch; delete window.__originalFetch; }")

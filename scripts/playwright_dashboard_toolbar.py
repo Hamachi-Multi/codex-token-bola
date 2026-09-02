@@ -436,6 +436,10 @@ def check_toolbar(page) -> None:
           settingsViewActive: document.querySelector('[data-view="settings"]').classList.contains('active'),
           activeView: document.body.dataset.activeView || '',
           toolbarDisplay: getComputedStyle(document.querySelector('.toolbar')).display,
+          filterDisplay: getComputedStyle(document.querySelector('.custom-filter-control')).display,
+          sessionDisplay: getComputedStyle(document.querySelector('.session-control')).display,
+          refreshDisplay: getComputedStyle(document.querySelector('#refresh')).display,
+          analyzeDisplay: getComputedStyle(document.querySelector('#rebuild')).display,
           queryStatusDisplay: getComputedStyle(document.querySelector('#query-status')).display,
           settingsPanelCount: document.querySelectorAll('[data-view="settings"] .settings-master-detail > .panel').length,
           hash: location.hash,
@@ -471,8 +475,10 @@ def check_toolbar(page) -> None:
         f"settings navigation should activate the list and detail panels: {theme_initial_state}",
     )
     assert_true(
-        theme_initial_state["toolbarDisplay"] == "flex" and theme_initial_state["queryStatusDisplay"] == "none",
-        f"settings should preserve the shared desktop toolbar while hiding empty status: {theme_initial_state}",
+        theme_initial_state["toolbarDisplay"] == "flex"
+        and theme_initial_state["queryStatusDisplay"] == "none"
+        and {theme_initial_state[key] for key in ("filterDisplay", "sessionDisplay", "refreshDisplay", "analyzeDisplay")} == {"none"},
+        f"settings should hide analytics-only toolbar controls while preserving service status space: {theme_initial_state}",
     )
     assert_true(
         theme_initial_state["toggleTop"] >= theme_initial_state["settingsTop"]

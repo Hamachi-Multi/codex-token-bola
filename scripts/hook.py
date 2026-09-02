@@ -829,7 +829,7 @@ def handle_stop(data: dict[str, Any]) -> None:
     usage = resolved_usage.usage
     estimated = resolved_usage.estimated
     token_source = record["token_source"]
-    if resolved_usage.start_usage_source == "unavailable":
+    if resolved_usage.start_usage_source in {"unavailable", "counter_reset"}:
         token_source = "transcript_path token_count.info.last_token_usage aggregate after start offset"
     record.update(
         {

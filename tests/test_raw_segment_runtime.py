@@ -47,6 +47,46 @@ except ModuleNotFoundError:
 
 
 class RawSegmentRuntimeTests(unittest.TestCase):
+    def test_resolved_turn_usage_falls_back_when_cumulative_counter_resets(self) -> None:
+        normalize = load_module("turn_capture_counter_reset_test", ROOT / "scripts" / "normalize.py")
+        turn_capture = normalize.turn_capture
+        resolved = turn_capture.resolved_turn_usage(
+            {
+                "start_token_usage": {
+                    "input_tokens": 1_000,
+                    "cached_input_tokens": 800,
+                    "output_tokens": 100,
+                    "reasoning_output_tokens": 20,
+                    "total_tokens": 1_100,
+                },
+                "start_usage_source": "tail_token_count",
+            },
+            {
+                "total_token_usage": {
+                    "input_tokens": 30,
+                    "cached_input_tokens": 20,
+                    "output_tokens": 5,
+                    "reasoning_output_tokens": 1,
+                    "total_tokens": 35,
+                },
+                "model_calls": [
+                    {
+                        "usage": {
+                            "input_tokens": 30,
+                            "cached_input_tokens": 20,
+                            "output_tokens": 5,
+                            "reasoning_output_tokens": 1,
+                            "total_tokens": 35,
+                        }
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(resolved.usage["total_tokens"], 35)
+        self.assertEqual(resolved.start_usage_source, "counter_reset")
+        self.assertTrue(resolved.estimated)
+
     def test_turn_rows_index_prompt_start_time_separately_from_capture_time(self) -> None:
         build = load_module("build_analytics_prompt_time_test", ROOT / "scripts" / "build_analytics.py")
         con = sqlite3.connect(":memory:")
@@ -1023,6 +1063,34 @@ class RawSegmentRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result.status, "failed")
         self.assertTrue(state_exists)
+
+    def test_terminal_turn_finalization_preserves_state_after_sync_failure(self) -> None:
+        capture = load_module("hook_terminal_sync_failure_test", ROOT / "scripts" / "hook.py").turn_capture
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp) / "service"
+            state = base / "state" / "turn.json"
+            state.parent.mkdir(parents=True)
+            state.write_text(json.dumps({"record_type": "turn_start", "session_id": "s1", "turn_id": "t1"}), encoding="utf-8")
+            record = {"record_type": "turn_usage_raw", "session_id": "s1", "turn_id": "t1", "turn_status": "completed"}
+            with mock.patch.object(capture.os, "fdatasync", side_effect=OSError("sync blocked")):
+                result = capture.finalize_prompt_usage_result(record, state_path=state, base_dir=base)
+
+            state_exists = state.exists()
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.append_result.failure_reason, "append_sync_failed")
+        self.assertTrue(state_exists)
+
+    def test_new_current_segment_syncs_parent_directory_once(self) -> None:
+        raw_segments = load_module("raw_segments_new_segment_sync_test", ROOT / "scripts" / "raw_segments.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp) / "service"
+            with mock.patch.object(raw_segments._rotation, "fsync_dir") as sync_dir:
+                first = raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
+                second = raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
+
+        self.assertEqual(first, second)
+        sync_dir.assert_called_once_with(base / "raw" / "current")
 
     def test_terminal_turn_finalization_marks_failed_state_cleanup_as_finalized(self) -> None:
         capture = load_module("hook_terminal_cleanup_failure_test", ROOT / "scripts" / "hook.py").turn_capture

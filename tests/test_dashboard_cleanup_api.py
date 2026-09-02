@@ -651,6 +651,9 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
                 directory.mkdir(parents=True, exist_ok=True)
             report = reports / "report.json"
             report.write_bytes(b"x\n")
+            migration_evidence = reports / "migrations" / "transition-1" / "bad" / "prompt.jsonl"
+            migration_evidence.parent.mkdir(parents=True)
+            migration_evidence.write_text("SECRET-PROMPT\n", encoding="utf-8")
             files = [
                 base / "raw" / "prompt-usage.raw.jsonl",
                 raw_current / "prompt-usage.raw.jsonl.current.1.jsonl",
@@ -677,6 +680,7 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
             self.assertGreater(result["deleted_bytes"], 0)
             for path in files:
                 self.assertFalse(path.exists(), str(path))
+            self.assertFalse((reports / "migrations").exists())
             self.assertTrue(report.exists())
             self.assertTrue(lock.exists())
             self.assertTrue(outside.exists())

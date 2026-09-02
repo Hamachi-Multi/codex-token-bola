@@ -5,6 +5,46 @@ from __future__ import annotations
 from playwright_dashboard_helpers import assert_true, open_dashboard
 
 
+def check_mobile_detail_navigation(page, *, view: str, row_selector: str, detail_id: str) -> None:
+    page.locator(f'button[data-view-target="{view}"]').click()
+    page.wait_for_selector(row_selector, timeout=10_000)
+    page.evaluate("window.scrollTo(0, 0)")
+    rows = page.locator(row_selector)
+    row = rows.nth(1 if rows.count() > 1 else 0)
+    row.evaluate("el => { el.dataset.mobileReturnTarget = '1'; }")
+    row.locator(".row-select-button").click()
+    page.wait_for_function(
+        """
+        (detailId) => {
+          const panel = document.getElementById(detailId)?.closest('.panel');
+          if (!panel) return false;
+          const bounds = panel.getBoundingClientRect();
+          return bounds.top >= -1 && bounds.top < window.innerHeight;
+        }
+        """,
+        arg=detail_id,
+        timeout=10_000,
+    )
+    back = page.locator(f'[data-mobile-detail-back="{detail_id}"]')
+    assert_true(back.is_visible(), f"{view} mobile detail should expose a list return control")
+    back.click()
+    page.wait_for_function(
+        """
+        (rowSelector) => {
+          const active = document.activeElement;
+          const row = active?.closest(rowSelector);
+          if (!row || !active.matches('.row-select-button')) return false;
+          const bounds = row.getBoundingClientRect();
+          return row.dataset.mobileReturnTarget === '1'
+            && bounds.bottom > 0
+            && bounds.top < window.innerHeight;
+        }
+        """,
+        arg=row_selector,
+        timeout=10_000,
+    )
+
+
 def check_mobile(page, base_url: str) -> None:
     open_dashboard(page, base_url)
     page.locator('button[data-view-target="turns"]').click()
@@ -43,6 +83,44 @@ def check_mobile(page, base_url: str) -> None:
         f"mobile turn panel headers should share one height: {mobile_state}",
     )
 
+    for detail_case in (
+        {"view": "overview", "row_selector": "#projects tr[data-session-id]", "detail_id": "session-detail"},
+        {"view": "turns", "row_selector": "#turn-list tr[data-turn]", "detail_id": "detail"},
+        {"view": "tools", "row_selector": "#tool-output tr[data-tool]", "detail_id": "tool-detail"},
+        {"view": "subagents", "row_selector": "#subagent-rollups tr[data-confidence]", "detail_id": "subagent-mix"},
+    ):
+        check_mobile_detail_navigation(page, **detail_case)
+
+    page.set_viewport_size({"width": 1280, "height": 844})
+    page.locator('button[data-view-target="overview"]').click()
+    overview_rows = page.locator("#projects tr[data-session-id]")
+    desktop_row = overview_rows.nth(1 if overview_rows.count() > 1 else 0)
+    desktop_session = desktop_row.get_attribute("data-session-id") or ""
+    desktop_row.locator(".row-select-button").click()
+    page.wait_for_function(
+        """
+        (sessionId) => document.querySelector('#projects tr.selected')?.dataset.sessionId === sessionId
+          && !document.querySelector('#projects tr.selected').hasAttribute('aria-busy')
+        """,
+        arg=desktop_session,
+        timeout=10_000,
+    )
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.locator('[data-mobile-detail-back="session-detail"]').click()
+    page.wait_for_function(
+        """
+        (sessionId) => {
+          const active = document.activeElement;
+          const row = active?.closest('#projects tr[data-session-id]');
+          if (!row || row.dataset.sessionId !== sessionId) return false;
+          const bounds = row.getBoundingClientRect();
+          return bounds.bottom > 0 && bounds.top < window.innerHeight;
+        }
+        """,
+        arg=desktop_session,
+        timeout=10_000,
+    )
+
     page.locator('button[data-view-target="settings"]').click()
     settings_mobile_state = page.evaluate(
         """
@@ -56,6 +134,10 @@ def check_mobile(page, base_url: str) -> None:
             scrollWidth: doc.scrollWidth,
             clientWidth: doc.clientWidth,
             toolbarDisplay: getComputedStyle(document.querySelector('.toolbar')).display,
+            filterDisplay: getComputedStyle(document.querySelector('.custom-filter-control')).display,
+            sessionDisplay: getComputedStyle(document.querySelector('.session-control')).display,
+            refreshDisplay: getComputedStyle(document.querySelector('#refresh')).display,
+            analyzeDisplay: getComputedStyle(document.querySelector('#rebuild')).display,
             layoutColumns: getComputedStyle(layout).gridTemplateColumns,
             listWidth: Math.round(listPanel.getBoundingClientRect().width),
             detailWidth: Math.round(detailPanel.getBoundingClientRect().width),
@@ -74,6 +156,10 @@ def check_mobile(page, base_url: str) -> None:
         f"mobile settings page overflows horizontally: {settings_mobile_state}",
     )
     assert_true(settings_mobile_state["toolbarDisplay"] == "grid", f"mobile settings should preserve the shared toolbar: {settings_mobile_state}")
+    assert_true(
+        {settings_mobile_state[key] for key in ("filterDisplay", "sessionDisplay", "refreshDisplay", "analyzeDisplay")} == {"none"},
+        f"mobile settings should hide analytics-only toolbar controls: {settings_mobile_state}",
+    )
     assert_true(" " not in settings_mobile_state["layoutColumns"], f"mobile settings should stack list and detail panels: {settings_mobile_state}")
     assert_true(
         settings_mobile_state["detailTop"] >= settings_mobile_state["listBottom"]
@@ -109,6 +195,11 @@ def check_mobile(page, base_url: str) -> None:
           return {
             scrollWidth: doc.scrollWidth,
             clientWidth: doc.clientWidth,
+            filterDisplay: getComputedStyle(document.querySelector('.custom-filter-control')).display,
+            sessionDisplay: getComputedStyle(document.querySelector('.session-control')).display,
+            refreshDisplay: getComputedStyle(document.querySelector('#refresh')).display,
+            analyzeDisplay: getComputedStyle(document.querySelector('#rebuild')).display,
+            cleanupRefreshLabel: document.querySelector('#cleanup-refresh')?.textContent?.trim() || '',
             summaryColumns: summary ? getComputedStyle(summary).gridTemplateColumns : '',
             formDisplay: form ? getComputedStyle(form).display : '',
             allOptionDisplay: allOption ? getComputedStyle(allOption).display : '',
@@ -126,6 +217,11 @@ def check_mobile(page, base_url: str) -> None:
     assert_true(
         cleanup_mobile_state["scrollWidth"] <= cleanup_mobile_state["clientWidth"] + 1,
         f"mobile cleanup overflows horizontally: {cleanup_mobile_state}",
+    )
+    assert_true(
+        {cleanup_mobile_state[key] for key in ("filterDisplay", "sessionDisplay", "refreshDisplay", "analyzeDisplay")} == {"none"}
+        and cleanup_mobile_state["cleanupRefreshLabel"] == "Refresh Preview",
+        f"mobile cleanup should expose only cleanup-specific controls: {cleanup_mobile_state}",
     )
     assert_true(len(cleanup_mobile_state["summaryColumns"].split(" ")) == 1, f"mobile cleanup summary should be one column: {cleanup_mobile_state}")
     assert_true(cleanup_mobile_state["formDisplay"] == "grid", f"mobile cleanup controls should stack as grid: {cleanup_mobile_state}")

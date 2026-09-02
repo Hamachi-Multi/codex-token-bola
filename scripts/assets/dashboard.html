@@ -91,7 +91,7 @@
       <section class="metric-strip" id="summary"></section>
       <section class="overview-grid">
         <div class="panel"><div class="panel-head"><h2>Overview</h2><span class="hint">credits</span></div><div id="projects" class="list-panel-body scrollbar-hidden"></div><div class="list-footer"><div class="pager" id="projects-pager"></div></div></div>
-        <div class="panel"><div class="panel-head"><h2>Session Detail</h2><span class="hint" id="session-detail-status">select a session</span></div><div id="session-detail" class="empty scrollbar-hidden">Select a row to inspect details.</div></div>
+        <div class="panel"><div class="panel-head"><h2>Session Detail</h2><button class="mobile-detail-back" data-mobile-detail-back="session-detail" type="button">Back to list</button><span class="hint" id="session-detail-status">select a session</span></div><div id="session-detail" class="empty scrollbar-hidden">Select a row to inspect details.</div></div>
       </section>
     </section>
 
@@ -115,7 +115,7 @@
           </div>
         </div>
         <aside class="panel inspector">
-          <div class="panel-head"><h2>Selected Turn</h2><span class="hint" id="detail-status">none</span></div>
+          <div class="panel-head"><h2>Selected Turn</h2><button class="mobile-detail-back" data-mobile-detail-back="detail" type="button">Back to list</button><span class="hint" id="detail-status">none</span></div>
           <div id="detail" class="empty scrollbar-hidden">Select a row to inspect details.</div>
         </aside>
       </section>
@@ -124,14 +124,14 @@
     <section class="view" data-view="tools">
       <section class="two-col-layout detail-heavy-layout">
         <div class="panel"><div class="panel-head"><h2>Tools</h2><span class="hint">tokens</span></div><div id="tool-output" class="list-panel-body scrollbar-hidden"></div><div class="list-footer"><div class="pager" id="tool-output-pager"></div></div></div>
-        <div class="panel"><div class="panel-head"><h2>Tool Detail</h2><span class="hint" id="tool-detail-status">select a row</span></div><div id="tool-detail" class="empty scrollbar-hidden">Select a row to inspect details.</div></div>
+        <div class="panel"><div class="panel-head"><h2>Tool Detail</h2><button class="mobile-detail-back" data-mobile-detail-back="tool-detail" type="button">Back to list</button><span class="hint" id="tool-detail-status">select a row</span></div><div id="tool-detail" class="empty scrollbar-hidden">Select a row to inspect details.</div></div>
       </section>
     </section>
 
     <section class="view" data-view="subagents">
       <section class="two-col-layout detail-heavy-layout">
         <div class="panel"><div class="panel-head"><h2>Subagents</h2><span class="hint">attribution method</span></div><div id="subagent-rollups" class="list-panel-body scrollbar-hidden"></div></div>
-        <div class="panel"><div class="panel-head"><h2>Attribution Detail</h2><span class="hint" id="subagent-detail-status">select a row</span></div><div id="subagent-mix" class="empty scrollbar-hidden">Select a row to inspect details.</div></div>
+        <div class="panel"><div class="panel-head"><h2>Attribution Detail</h2><button class="mobile-detail-back" data-mobile-detail-back="subagent-mix" type="button">Back to list</button><span class="hint" id="subagent-detail-status">select a row</span></div><div id="subagent-mix" class="empty scrollbar-hidden">Select a row to inspect details.</div></div>
       </section>
     </section>
 
@@ -175,7 +175,7 @@
               </div>
               <div class="cleanup-action-row">
                 <div id="cleanup-action-status" class="cleanup-action-status" aria-live="polite"></div>
-                <button id="cleanup-refresh" class="primary" type="button">Refresh</button>
+                <button id="cleanup-refresh" class="primary" type="button">Refresh Preview</button>
                 <button id="cleanup-delete" class="danger" type="button">Delete Logs</button>
               </div>
             </div>

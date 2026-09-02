@@ -47,6 +47,13 @@ CLEANUP_ROW_DEFINITIONS = (
         "retention_effect": "retention state updated",
         "capabilities": ["delete_all"],
     },
+    {
+        "label": "Migration Evidence",
+        "group_id": "migration_evidence",
+        "role": "state",
+        "retention_effect": "preserved by date retention",
+        "capabilities": ["delete_all"],
+    },
 )
 
 CLEANUP_ROW_GROUPS = {str(row["label"]): dict(row) for row in CLEANUP_ROW_DEFINITIONS}

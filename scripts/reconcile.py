@@ -12,6 +12,7 @@ import json
 import pathlib
 import sys
 import time
+import zlib
 from typing import Any
 
 
@@ -35,6 +36,13 @@ STATE_DIR = OUTPUT_LAYOUT.state_dir
 BAD_DIR = OUTPUT_LAYOUT.bad_dir
 ERROR_LOG = OUTPUT_LAYOUT.error_log
 QUARANTINE_RESULTS: list[dict[str, Any]] = []
+
+
+class RawSegmentDiscoveryError(RuntimeError):
+    def __init__(self, path: pathlib.Path, cause: BaseException) -> None:
+        self.path = path
+        self.cause = cause
+        super().__init__(f"{path}: {type(cause).__name__}: {cause}")
 
 
 def move_bad_state(path: pathlib.Path, reason: str) -> None:
@@ -106,14 +114,30 @@ def prepare_raw_segment_sources() -> None:
     raw_segments.reconcile_pending_rotation(BASE_DIR)
 
 
-def completed_turn_index() -> set[tuple[str, str]]:
+def prompt_log_sources() -> tuple[pathlib.Path, ...]:
     prepare_raw_segment_sources()
+    return (*archived_prompt_logs(), *current_prompt_logs())
+
+
+def recovery_state_paths() -> list[pathlib.Path]:
+    return [
+        path
+        for path in sorted(STATE_DIR.glob("*.json"))
+        if len(path.stem) == 32 and all(char in "0123456789abcdef" for char in path.stem.lower())
+    ]
+
+
+def completed_turn_index(*, sources: tuple[pathlib.Path, ...] | None = None) -> set[tuple[str, str]]:
+    selected_sources = prompt_log_sources() if sources is None else sources
     completed: set[tuple[str, str]] = set()
-    for source in (*archived_prompt_logs(), *current_prompt_logs()):
-        for row in iter_jsonl(source) or []:
-            completed_turn = completed_turn_from_row(row)
-            if completed_turn is not None:
-                completed.add(completed_turn)
+    for source in selected_sources:
+        try:
+            for row in iter_jsonl(source) or []:
+                completed_turn = completed_turn_from_row(row)
+                if completed_turn is not None:
+                    completed.add(completed_turn)
+        except (EOFError, OSError, UnicodeError, zlib.error) as exc:
+            raise RawSegmentDiscoveryError(source, exc) from exc
     return completed
 
 
@@ -216,7 +240,7 @@ def reconcile_one(path: pathlib.Path, completed_turns: set[tuple[str, str]]) -> 
         estimated = resolved_usage.estimated
         token_source = (
             "transcript_path token_count.info.last_token_usage aggregate after start offset"
-            if resolved_usage.start_usage_source == "unavailable"
+            if resolved_usage.start_usage_source in {"unavailable", "counter_reset"}
             else "reconcile: transcript token_count diff bounded by turn end event"
         )
     else:
@@ -392,8 +416,10 @@ def run_reconcile() -> int:
     QUARANTINE_RESULTS.clear()
     counts: dict[str, int] = {}
     try:
-        completed_turns = completed_turn_index()
-    except (OSError, raw_segments.ManifestError, turn_resolution.TokenResolutionError) as exc:
+        sources = prompt_log_sources()
+        state_paths = recovery_state_paths()
+        completed_turns = completed_turn_index(sources=sources) if state_paths else set()
+    except (OSError, RawSegmentDiscoveryError, raw_segments.ManifestError, turn_resolution.TokenResolutionError) as exc:
         print(
             json.dumps(
                 {"status": "failed", "error": "raw_segment_discovery_failed", "detail": str(exc)},
@@ -402,7 +428,7 @@ def run_reconcile() -> int:
             )
         )
         return 1
-    for path in sorted(STATE_DIR.glob("*.json")):
+    for path in state_paths:
         result = reconcile_one(path, completed_turns)
         counts[result] = counts.get(result, 0) + 1
     quarantine = quarantine_health.operation_summary(QUARANTINE_RESULTS)

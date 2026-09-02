@@ -231,7 +231,7 @@ class QuarantineHealthTests(unittest.TestCase):
             base = pathlib.Path(tmp_dir)
             state_dir = base / "state"
             state_dir.mkdir(parents=True)
-            pending = state_dir / "pending.json"
+            pending = state_dir / ("a" * 32 + ".json")
             pending.write_text("{", encoding="utf-8")
             reconcile.BASE_DIR = base
             reconcile.STATE_DIR = state_dir

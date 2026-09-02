@@ -2524,6 +2524,21 @@
       background: var(--surface);
     }
     .panel-head .hint { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+    .mobile-detail-back { display: none; }
+    body[data-active-view="cleanup"] .custom-filter-control,
+    body[data-active-view="cleanup"] .session-control,
+    body[data-active-view="cleanup"] #refresh,
+    body[data-active-view="cleanup"] #rebuild,
+    body[data-active-view="settings"] .custom-filter-control,
+    body[data-active-view="settings"] .session-control,
+    body[data-active-view="settings"] #refresh,
+    body[data-active-view="settings"] #rebuild {
+      display: none;
+    }
+    body[data-active-view="cleanup"] .toolbar,
+    body[data-active-view="settings"] .toolbar {
+      min-height: 34px;
+    }
     .query-status {
       position: fixed;
       right: 20px;
@@ -4094,6 +4109,19 @@
       .panel-head {
         align-items: center;
         flex-direction: row;
+      }
+      .mobile-detail-back {
+        display: inline-flex;
+        align-items: center;
+        width: auto;
+        height: 28px;
+        margin-left: auto;
+        padding: 0 9px;
+        border-color: var(--border-strong);
+        background: var(--surface-2);
+        color: var(--text);
+        font-size: 11px;
+        font-weight: 700;
       }
       .panel-head > h2 {
         flex: 0 0 auto;

@@ -387,6 +387,48 @@ class CliHookTests(CliTestCase):
         self.assertIn(unrelated, commands)
         self.assertIn(cli.hook_command(), commands)
 
+    def test_install_hook_canonicalizes_top_level_and_nested_owned_registrations(self) -> None:
+        cli = load_module("install_hook_mixed_roots_test", ROOT / "scripts" / "bola.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            codex_dir = self.initialize_codex_dir(pathlib.Path(tmp_dir) / ".codex")
+            hooks_path = codex_dir / "hooks.json"
+            expected = cli.hook_command()
+            stale = "python3 /old/checkout/hooks/token-usage.py --codex-token-bola-hook"
+            unrelated_top = "python3 /tmp/top.py"
+            unrelated_nested = "python3 /tmp/nested.py"
+            unrelated_hybrid = "python3 /tmp/hybrid.py"
+            hooks_path.write_text(
+                json.dumps(
+                    {
+                        "custom": {"keep": True},
+                        "Stop": [{"command": stale}, {"command": unrelated_top}],
+                        "hooks": {
+                            "Stop": [
+                                {"hooks": [{"type": "command", "command": expected}]},
+                                {"hooks": [{"type": "command", "command": expected}]},
+                                {"hooks": [{"type": "command", "command": unrelated_nested}]},
+                                {"command": unrelated_hybrid, "hooks": [{"type": "command", "command": stale}]},
+                            ]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            before = cli.hooks_json_status(codex_dir)
+            result = cli.merge_hooks_json_registration(codex_dir)
+            parsed = json.loads(hooks_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(before["events"]["Stop"]["stale_commands"], [stale, expected, stale])
+        self.assertEqual(parsed["custom"], {"keep": True})
+        self.assertEqual(parsed["Stop"], [{"command": unrelated_top}])
+        commands = result["events"]["Stop"]["commands"]
+        self.assertEqual(commands.count(expected), 1)
+        self.assertIn(unrelated_top, commands)
+        self.assertIn(unrelated_nested, commands)
+        self.assertIn(unrelated_hybrid, commands)
+        self.assertEqual(result["events"]["Stop"]["stale_commands"], [])
+
     def test_install_hook_uses_exact_interpreter_and_module(self) -> None:
         cli = load_module("install_hook_quoted_command_test", ROOT / "scripts" / "bola.py")
         command = cli.hook_command()
@@ -414,5 +456,3 @@ class CliHookTests(CliTestCase):
         self.assertTrue(result["hooks_json"]["updated"])
         self.assertIn(f"echo {installed}", commands)
         self.assertIn(cli.hook_command(), commands)
-
-

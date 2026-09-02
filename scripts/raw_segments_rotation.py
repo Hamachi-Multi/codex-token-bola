@@ -45,6 +45,11 @@ def new_current_segment(base: pathlib.Path, *, kind: str, source_name: str | Non
     path = raw_current / f"{segment_id}.jsonl"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(fd)
+    try:
+        fsync_dir(raw_current)
+    except OSError:
+        path.unlink(missing_ok=True)
+        raise
     return {
         "id": segment_id,
         "kind": kind,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sys
 import time
@@ -72,6 +73,41 @@ def int_metadata(metadata: dict[str, object], key: str, default: int = 0) -> int
         return int(metadata.get(key, default) or 0)
     except (TypeError, ValueError):
         return default
+
+
+def output_dir_status(path: pathlib.Path) -> dict[str, object]:
+    status: dict[str, object] = {
+        "path": str(path),
+        "exists": path.exists(),
+        "bytes": path.stat().st_size if path.exists() and path.is_file() else None,
+        "is_directory": path.is_dir() if path.exists() else None,
+        "writable": None,
+        "write_probe_error": None,
+    }
+    if not path.exists() or not path.is_dir():
+        return status
+    probe = path / f".bola-doctor-write-probe-{os.getpid()}-{time.time_ns()}"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(descriptor, b"1")
+        os.fsync(descriptor)
+        status["writable"] = True
+    except OSError as exc:
+        status["writable"] = False
+        status["write_probe_error"] = {"type": type(exc).__name__, "errno": exc.errno}
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError as exc:
+            status["writable"] = False
+            status["write_probe_error"] = {"type": type(exc).__name__, "errno": exc.errno}
+    return status
 
 
 def current_segments_status(base: pathlib.Path) -> dict[str, object]:
@@ -314,6 +350,12 @@ def doctor_health(report: dict[str, object]) -> dict[str, object]:
         )
     if isinstance(dir_status, dict) and not dir_status.get("valid"):
         add_issue("codex_dir_invalid", "failed", reason=dir_status.get("reason"))
+    output_dir = report.get("output_dir")
+    if isinstance(output_dir, dict) and output_dir.get("exists"):
+        if output_dir.get("is_directory") is False:
+            add_issue("output_dir_not_directory", "failed", path=output_dir.get("path"))
+        elif output_dir.get("writable") is False:
+            add_issue("output_dir_unwritable", "failed", path=output_dir.get("path"), error=output_dir.get("write_probe_error"))
     if isinstance(cli_status, dict) and not cli_status.get("valid"):
         add_issue("codex_cli_invalid", "failed", reason=cli_status.get("reason"))
     if not isinstance(runtime, dict):
@@ -455,6 +497,7 @@ def run_doctor(options: DoctorOptions, dependencies: DoctorDependencies) -> Doct
         }
         for key, path in inspected_paths.items()
     }
+    report["output_dir"] = output_dir_status(base)
     report["codex_dir"] = dependencies.codex_dir_status(codex_dir)
     report["codex_cli"] = dependencies.codex_cli_status()
     config = report["config"]

@@ -308,6 +308,45 @@ def unresolved_zero_estimate(row: dict[str, Any]) -> bool:
     return turn_resolution.status_from_row(row) == turn_resolution.PENDING
 
 
+def repair_negative_usage(row: dict[str, Any]) -> dict[str, Any]:
+    if turn_resolution.status_from_row(row) == turn_resolution.PENDING:
+        return row
+    usage = normalize_usage(row.get("usage"))
+    if all(usage[key] >= 0 for key in USAGE_KEYS):
+        return row
+    snapshot = task_lifecycle_token_usage(row.get("transcript_path"), str(row.get("turn_id") or ""))
+    snapshot_usage = normalize_usage(snapshot.get("total_token_usage"))
+    usable_count = safe_int(snapshot.get("usable_last_token_usage_count"))
+    repaired = dict(row)
+    repaired["usage_repair_reason"] = "cumulative_counter_reset"
+    repaired["estimated"] = True
+    if snapshot.get("found") and usable_count > 0 and all(snapshot_usage[key] >= 0 for key in USAGE_KEYS):
+        repaired.update(
+            {
+                "usage": snapshot_usage,
+                "start_token_usage": None,
+                "end_token_usage": snapshot_usage,
+                "end_token_snapshot": dict(snapshot),
+                "model_call_count": usable_count,
+                "token_resolution_status": turn_resolution.RESOLVED,
+                "token_resolution_reason": None,
+                "token_source": snapshot.get("token_source"),
+            }
+        )
+        return repaired
+    repaired.update(
+        {
+            "usage": zero_usage(),
+            "start_token_usage": None,
+            "end_token_usage": zero_usage(),
+            "model_call_count": 0,
+            "token_resolution_status": turn_resolution.UNAVAILABLE,
+            "token_resolution_reason": "negative_usage_counter_reset_unrecoverable",
+        }
+    )
+    return repaired
+
+
 def append_bad(source: str, line_no: int, line: str, error: str) -> None:
     captured_at_ns = time.time_ns()
     event = quarantine_health.event_id(kind="normalize_raw", source=source, content=line, error=error)
@@ -538,6 +577,7 @@ def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     row = repair_terminal_metadata(row)
     row = recover_missing_start_state_lifecycle(row)
     row = recover_pending_token_resolution(row)
+    row = repair_negative_usage(row)
     status = row.get("turn_status") or "completed"
     normalized = dict(row)
     normalized["schema_version"] = 2

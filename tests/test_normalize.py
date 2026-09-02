@@ -10,7 +10,72 @@ class NormalizeTests(unittest.TestCase):
     def test_normalize_logic_version_includes_usable_token_evidence_contract(self) -> None:
         normalize = load_module("normalize_usable_evidence_version_test", ROOT / "scripts" / "normalize.py")
 
-        self.assertEqual(normalize.NORMALIZE_LOGIC_VERSION, 9)
+        self.assertEqual(normalize.NORMALIZE_LOGIC_VERSION, 10)
+
+    def test_normalize_repairs_negative_usage_from_turn_lifecycle(self) -> None:
+        normalize = load_module("normalize_negative_usage_repair_test", ROOT / "scripts" / "normalize.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = pathlib.Path(tmp) / "rollout.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    json.dumps(item)
+                    for item in [
+                        {"timestamp": "2026-05-31T10:00:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": "t-reset"}},
+                        {
+                            "timestamp": "2026-05-31T10:00:01Z",
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "token_count",
+                                "info": {
+                                    "last_token_usage": {
+                                        "input_tokens": 30,
+                                        "cached_input_tokens": 20,
+                                        "output_tokens": 5,
+                                        "reasoning_output_tokens": 1,
+                                        "total_tokens": 35,
+                                    }
+                                },
+                            },
+                        },
+                        {"timestamp": "2026-05-31T10:00:02Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t-reset"}},
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            row = _turn_raw("s-reset", "t-reset", total=-965) | {
+                "transcript_path": str(transcript),
+                "usage": {
+                    "input_tokens": -970,
+                    "cached_input_tokens": -780,
+                    "output_tokens": 5,
+                    "reasoning_output_tokens": 1,
+                    "total_tokens": -965,
+                },
+                "start_token_usage": {"input_tokens": 1_000, "cached_input_tokens": 800, "total_tokens": 1_100},
+                "end_token_usage": {"input_tokens": 30, "cached_input_tokens": 20, "output_tokens": 5, "total_tokens": 35},
+            }
+
+            normalized = normalize.normalize_row(row)
+
+        self.assertEqual(normalized["usage"]["total_tokens"], 35)
+        self.assertEqual(normalized["usage"]["input_tokens"], 30)
+        self.assertEqual(normalized["token_resolution_status"], "resolved")
+        self.assertEqual(normalized["usage_repair_reason"], "cumulative_counter_reset")
+        self.assertTrue(normalized["estimated"])
+
+    def test_normalize_excludes_unrecoverable_negative_usage(self) -> None:
+        normalize = load_module("normalize_negative_usage_unavailable_test", ROOT / "scripts" / "normalize.py")
+        row = _turn_raw("s-reset", "t-reset", total=-965) | {
+            "transcript_path": None,
+            "usage": {"input_tokens": -970, "output_tokens": 5, "total_tokens": -965},
+        }
+
+        normalized = normalize.normalize_row(row)
+
+        self.assertEqual(normalized["usage"]["total_tokens"], 0)
+        self.assertEqual(normalized["token_resolution_status"], "unavailable")
+        self.assertEqual(normalized["token_resolution_reason"], "negative_usage_counter_reset_unrecoverable")
 
     def test_normalize_drops_obsolete_instruction_excerpt_fields(self) -> None:
         normalize = load_module("normalize_prompt_metadata_test", ROOT / "scripts" / "normalize.py")

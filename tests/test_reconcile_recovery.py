@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import gzip
+import io
+
 try:
     from tests.support import (
         ROOT,
@@ -25,6 +28,42 @@ except ModuleNotFoundError:
 
 
 class ReconcileRecoveryTests(unittest.TestCase):
+    def test_run_reconcile_skips_raw_content_scan_without_recovery_state(self) -> None:
+        reconcile = load_module("reconcile_empty_state_fast_path_test", ROOT / "scripts" / "reconcile.py")
+        with (
+            mock.patch.object(reconcile, "prompt_log_sources", return_value=(pathlib.Path("/tmp/raw.jsonl"),)) as sources,
+            mock.patch.object(reconcile, "recovery_state_paths", return_value=[]),
+            mock.patch.object(reconcile, "completed_turn_index", side_effect=AssertionError("raw content must not be scanned")),
+            mock.patch.object(reconcile, "quarantine_health") as quarantine,
+            mock.patch.object(reconcile, "print", create=True),
+        ):
+            quarantine.operation_summary.return_value = {"unacknowledged_events": 0}
+            code = reconcile.run_reconcile()
+
+        self.assertEqual(code, 0)
+        sources.assert_called_once_with()
+
+    def test_run_reconcile_reports_truncated_gzip_with_source_path(self) -> None:
+        reconcile = load_module("reconcile_truncated_gzip_test", ROOT / "scripts" / "reconcile.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = pathlib.Path(tmp_dir)
+            source = root / "prompt-usage.raw.jsonl.gz"
+            source.write_bytes(gzip.compress(b"{}\n")[:-4])
+            marker = root / ("a" * 32 + ".json")
+            marker.write_text('{"record_type":"turn_start"}\n', encoding="utf-8")
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(reconcile, "prompt_log_sources", return_value=(source,)),
+                mock.patch.object(reconcile, "recovery_state_paths", return_value=[marker]),
+                mock.patch.object(reconcile.sys, "stdout", stdout),
+            ):
+                code = reconcile.run_reconcile()
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["error"], "raw_segment_discovery_failed")
+        self.assertIn(str(source), payload["detail"])
+        self.assertIn("EOFError", payload["detail"])
     def test_reconcile_quarantines_non_object_json_state(self) -> None:
         reconcile = load_module("reconcile_non_object_state_test", ROOT / "scripts" / "reconcile.py")
         with tempfile.TemporaryDirectory() as tmp:

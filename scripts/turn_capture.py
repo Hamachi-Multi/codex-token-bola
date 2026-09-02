@@ -90,7 +90,7 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _append_jsonl_result(path: pathlib.Path, record: dict[str, Any]) -> AppendResult:
+def _append_jsonl_result(path: pathlib.Path, record: dict[str, Any], *, durable: bool = False) -> AppendResult:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -100,13 +100,19 @@ def _append_jsonl_result(path: pathlib.Path, record: dict[str, Any]) -> AppendRe
     except OSError as exc:
         return _append_failure("append", "append_open_failed", exc)
     descriptor: int | None = fd
+    failure_reason = "append_write_failed"
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as handle:
             descriptor = None
             handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            if durable:
+                handle.flush()
+                failure_reason = "append_sync_failed"
+                sync = getattr(os, "fdatasync", os.fsync)
+                sync(handle.fileno())
     except OSError as exc:
-        return _append_failure("append", "append_write_failed", exc)
+        return _append_failure("append", failure_reason, exc)
     finally:
         if descriptor is not None:
             try:
@@ -127,6 +133,7 @@ def append_current_segment_jsonl_result(
     kind: str,
     source_name: str,
     lock_timeout_ms: int = DEFAULT_APPEND_LOCK_TIMEOUT_MS,
+    durable: bool = False,
 ) -> AppendResult:
     base = pathlib.Path(base_dir).expanduser()
     deadline = time.monotonic() + max(0, lock_timeout_ms) / 1000
@@ -162,7 +169,7 @@ def append_current_segment_jsonl_result(
             return _append_failure("segment", "segment_manifest_error")
         except OSError as exc:
             return _append_failure("segment", "segment_io_error", exc)
-        return _append_jsonl_result(pathlib.Path(current["path"]), record)
+        return _append_jsonl_result(pathlib.Path(current["path"]), record, durable=durable)
     except OSError as exc:
         return _append_failure("lock", "lock_prepare_failed", exc)
     finally:
@@ -201,6 +208,7 @@ def append_prompt_usage_result(
     *,
     base_dir: pathlib.Path | str,
     lock_timeout_ms: int = DEFAULT_APPEND_LOCK_TIMEOUT_MS,
+    durable: bool = False,
 ) -> AppendResult:
     return append_current_segment_jsonl_result(
         record,
@@ -208,6 +216,7 @@ def append_prompt_usage_result(
         kind="prompt_usage",
         source_name=raw_segments.PROMPT_RAW_NAME,
         lock_timeout_ms=lock_timeout_ms,
+        durable=durable,
     )
 
 
@@ -672,7 +681,12 @@ def finalize_missing_start_terminal_result(
             append_result = None
             status = "duplicate"
         else:
-            append_result = append_prompt_usage_result(record, base_dir=base_dir, lock_timeout_ms=lock_timeout_ms)
+            append_result = append_prompt_usage_result(
+                record,
+                base_dir=base_dir,
+                lock_timeout_ms=lock_timeout_ms,
+                durable=True,
+            )
             if not append_result:
                 return TurnFinalizationResult("failed", append_result)
             status = "appended"
@@ -798,7 +812,12 @@ def finalize_prompt_usage_result(
                 pass
             return TurnFinalizationResult("duplicate")
 
-        append_result = append_prompt_usage_result(record, base_dir=base_dir, lock_timeout_ms=lock_timeout_ms)
+        append_result = append_prompt_usage_result(
+            record,
+            base_dir=base_dir,
+            lock_timeout_ms=lock_timeout_ms,
+            durable=True,
+        )
         if not append_result:
             return TurnFinalizationResult("failed", append_result)
         try:
@@ -852,6 +871,10 @@ def usage_from_model_calls(snapshot: dict[str, Any]) -> dict[str, Any]:
     return usage_delta(zero_usage(), usage_sum([call.get("usage") for call in calls if isinstance(call, dict)]))
 
 
+def cumulative_usage_reset(start: dict[str, int], end: dict[str, int]) -> bool:
+    return any(safe_int(end.get(key)) < safe_int(start.get(key)) for key in USAGE_KEYS)
+
+
 def resolved_turn_usage(start_state: dict[str, Any], end_snapshot: dict[str, Any]) -> ResolvedTurnUsage:
     start_usage = normalize_usage(start_state.get("start_token_usage"))
     end_usage = normalize_usage(end_snapshot.get("total_token_usage"))
@@ -860,12 +883,15 @@ def resolved_turn_usage(start_state: dict[str, Any], end_snapshot: dict[str, Any
         start_snapshot = start_state.get("start_token_snapshot")
         start_usage_source = "legacy_full_scan" if isinstance(start_snapshot, dict) and start_snapshot.get("found") else "unavailable"
     source = str(start_usage_source)
+    if source != "unavailable" and cumulative_usage_reset(start_usage, end_usage):
+        source = "counter_reset"
+    use_model_calls = source in {"unavailable", "counter_reset"}
     return ResolvedTurnUsage(
         start_usage=start_usage,
         end_usage=end_usage,
-        usage=usage_from_model_calls(end_snapshot) if source == "unavailable" else usage_delta(start_usage, end_usage),
+        usage=usage_from_model_calls(end_snapshot) if use_model_calls else usage_delta(start_usage, end_usage),
         start_usage_source=source,
-        estimated=source == "unavailable",
+        estimated=use_model_calls,
     )
 
 
