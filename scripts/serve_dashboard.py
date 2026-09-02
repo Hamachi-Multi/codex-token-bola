@@ -98,6 +98,7 @@ def shutdown_dashboard_operations(manager: dashboard_operation_state.DashboardOp
             active.process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             active.process.kill_group()
+        manager.wait_until_idle()
         return
 
 
@@ -139,6 +140,17 @@ class Handler(
         server = getattr(self, "server", None)
         runtime_manager = getattr(server, "runtime_manager", None)
         return runtime_manager.lifetime_lock_fd() if runtime_manager is not None else None
+
+    def begin_dashboard_operation(self, kind: str, *, operation_id: str | None = None):
+        server = getattr(self, "server", None)
+        runtime_manager = getattr(server, "runtime_manager", None)
+        if runtime_manager is None:
+            paths = self.dashboard_runtime_paths()
+            lease = self.dashboard_operation_manager().begin(kind, paths.output_dir, operation_id=operation_id)
+            return lease
+        lease, paths = runtime_manager.begin_operation(kind, operation_id=operation_id)
+        self._runtime_paths_snapshot = paths
+        return lease
 
     def dashboard_runtime_paths(self) -> service_paths.RuntimePaths:
         cached = getattr(self, "_runtime_paths_snapshot", None)
@@ -501,16 +513,6 @@ class Handler(
         except Exception:
             logging.exception("dashboard post api error path=%s", parsed.path)
             self.send_json({"error": "internal_error"}, 500)
-
-    def parse_last_json(self, stdout: str) -> dict[str, Any]:
-        for line in reversed(stdout.splitlines()):
-            try:
-                parsed = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(parsed, dict):
-                return parsed
-        return {}
 
     def numeric_metadata(self, metadata: dict[str, Any], key: str, default: float = 0.0) -> float:
         try:

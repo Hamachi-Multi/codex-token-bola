@@ -54,6 +54,9 @@ __all__ = [
 ]
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+SCRIPT_ROOT = ROOT / "scripts"
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
 TEST_RUNTIME = tempfile.TemporaryDirectory(prefix="bola-test-runtime-")
 TEST_RUNTIME_ROOT = pathlib.Path(TEST_RUNTIME.name)
 os.environ["BOLA_OUTPUT_DIR"] = str(TEST_RUNTIME_ROOT / "output")

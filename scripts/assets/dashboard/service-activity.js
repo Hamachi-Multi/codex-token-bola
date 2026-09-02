@@ -1,4 +1,5 @@
 import { getJSON } from './api.js';
+import { normalizeServiceOperation, operationActionLabel } from './service-operations.js';
 
 const IDLE_STATUS = Object.freeze({
   running: false,
@@ -18,7 +19,7 @@ function normalizedStatus(payload) {
     : Number(payload.overall_progress);
   return {
     running: true,
-    operation: ['analysis', 'cleanup', 'cost_recalculation'].includes(payload.operation) ? payload.operation : 'analysis',
+    operation: normalizeServiceOperation(payload.operation),
     status: 'running',
     progress_available: Boolean(payload.progress_available) && Number.isFinite(progress),
     phase: String(payload.phase || ''),
@@ -29,9 +30,7 @@ function normalizedStatus(payload) {
 }
 
 function activityLabel(status) {
-  const action = status.operation === 'cleanup'
-    ? 'Cleanup'
-    : (status.operation === 'cost_recalculation' ? 'Recalculate' : 'Analyze');
+  const action = operationActionLabel(status.operation);
   if (!status.progress_available) return action;
   return `${action} · ${Math.round(status.overall_progress)}%`;
 }

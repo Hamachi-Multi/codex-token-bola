@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import pathlib
 import sqlite3
 import sys
@@ -16,29 +15,13 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import cost_rates
 import cost_unit_recalculation
+import analytics_metadata
 import dashboard_operation_state
 import service_lock
 
 
 def _analytics_metadata(db_path: pathlib.Path) -> dict[str, Any]:
-    if not db_path.is_file():
-        return {}
-    con: sqlite3.Connection | None = None
-    try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        rows = con.execute("select key, value from run_metadata").fetchall()
-    except sqlite3.Error:
-        return {}
-    finally:
-        if con is not None:
-            con.close()
-    result: dict[str, Any] = {}
-    for key, value in rows:
-        try:
-            result[str(key)] = json.loads(value)
-        except (TypeError, json.JSONDecodeError):
-            result[str(key)] = value
-    return result
+    return analytics_metadata.read_run_metadata(db_path)
 
 
 def _detected_models(db_path: pathlib.Path) -> list[dict[str, Any]]:
@@ -219,7 +202,8 @@ class DashboardCostRatesApiMixin:
 
         manager = self.dashboard_operation_manager()
         try:
-            lease = manager.begin("cost_recalculation", self.dashboard_output_dir())
+            starter = getattr(self, "begin_dashboard_operation", None)
+            lease = starter("cost_recalculation") if callable(starter) else manager.begin("cost_recalculation", self.dashboard_output_dir())
         except dashboard_operation_state.ServerShuttingDown:
             self.send_json({"error": "server_shutting_down"}, 503)
             return

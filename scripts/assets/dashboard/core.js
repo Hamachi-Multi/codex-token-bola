@@ -19,6 +19,10 @@ export const CLEANUP_RETENTION_MODES = ['1', '7', '14', '30', '90', 'all', 'cust
 export const SESSION_LABEL_MODES = new Set(['project', 'thread']);
 export const SETTINGS_KEY = 'bola-dashboard-settings';
 
+export function defaultTurnSortDir(key) {
+  return ['session', 'prompt', 'status'].includes(key) ? 'asc' : 'desc';
+}
+
 export const state = {
   selected: null,
   selectedSession: null,

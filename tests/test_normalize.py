@@ -7,6 +7,11 @@ except ModuleNotFoundError:
 
 
 class NormalizeTests(unittest.TestCase):
+    def test_normalize_logic_version_includes_usable_token_evidence_contract(self) -> None:
+        normalize = load_module("normalize_usable_evidence_version_test", ROOT / "scripts" / "normalize.py")
+
+        self.assertEqual(normalize.NORMALIZE_LOGIC_VERSION, 9)
+
     def test_normalize_drops_obsolete_instruction_excerpt_fields(self) -> None:
         normalize = load_module("normalize_prompt_metadata_test", ROOT / "scripts" / "normalize.py")
         row = _turn_raw("s-prompt", "t-prompt", total=20)
@@ -312,6 +317,79 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(normalized["usage"]["total_tokens"], 37)
         self.assertEqual(normalized["model_call_count"], 1)
         self.assertTrue(normalized["estimated"])
+
+    def test_missing_start_empty_token_info_is_unavailable(self) -> None:
+        normalize = load_module("normalize_goal_auto_empty_token_info_test", ROOT / "scripts" / "normalize.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = pathlib.Path(tmp) / "rollout.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in [
+                        {
+                            "timestamp": "2026-05-31T10:00:00.000Z",
+                            "type": "event_msg",
+                            "payload": {"type": "task_started", "turn_id": "t-empty"},
+                        },
+                        {
+                            "timestamp": "2026-05-31T10:00:01.000Z",
+                            "type": "event_msg",
+                            "payload": {"type": "token_count", "info": {}},
+                        },
+                        {
+                            "timestamp": "2026-05-31T10:00:02.000Z",
+                            "type": "event_msg",
+                            "payload": {"type": "task_complete", "turn_id": "t-empty"},
+                        },
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            row = {
+                "record_type": "turn_usage_raw",
+                "session_id": "s-empty",
+                "turn_id": "t-empty",
+                "transcript_path": str(transcript),
+                "turn_status": "incomplete",
+                "lifecycle_end_reason": "missing_start_state",
+                "usage": {},
+                "estimated": True,
+            }
+
+            normalized = normalize.normalize_row(row)
+
+        self.assertEqual(normalized["token_resolution_status"], "unavailable")
+        self.assertEqual(normalized["token_resolution_reason"], "no_token_count_before_task_complete")
+        self.assertEqual(normalized["model_call_count"], 0)
+
+    def test_normalize_repairs_historical_terminal_metadata(self) -> None:
+        normalize = load_module("normalize_terminal_metadata_repair_test", ROOT / "scripts" / "normalize.py")
+        row = {
+            "record_type": "turn_usage_raw",
+            "session_id": "s1",
+            "turn_id": "t1",
+            "turn_status": "completed",
+            "lifecycle_end_reason": None,
+            "stopped_at": None,
+            "usage": {"total_tokens": 10},
+            "end_token_usage": {"total_tokens": 10},
+            "end_token_snapshot": {
+                "turn_end_event": {
+                    "type": "turn_aborted",
+                    "turn_id": "t1",
+                    "reason": "interrupted",
+                    "aborted_at": 1780221604,
+                    "timestamp": "2026-05-31T10:00:05Z",
+                }
+            },
+        }
+
+        normalized = normalize.normalize_row(row)
+
+        self.assertEqual(normalized["turn_status"], "aborted")
+        self.assertEqual(normalized["lifecycle_end_reason"], "interrupted")
+        self.assertEqual(normalized["stopped_at"], "2026-05-31T10:00:04+00:00")
 
     def test_goal_auto_lifecycle_recovery_scans_each_transcript_once(self) -> None:
         normalize = load_module("normalize_goal_auto_recovery_cache_test", ROOT / "scripts" / "normalize.py")

@@ -13,10 +13,12 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import cancel_control
 import dashboard_cleanup
+import dashboard_cleanup_recovery
 import progress_control
+import quarantine_health
 import service_lock
 import service_paths
-from runtime_command_runner import ProcessResult, RuntimeCommand
+from runtime_command_runner import ProcessResult, RuntimeCommand, required_json_contract_error
 
 
 @dataclass(frozen=True)
@@ -56,16 +58,11 @@ def completed_degraded(result: ProcessResult) -> bool:
     return result.exit_code == 1 and bool(result.payload) and result.payload.get("status") == "degraded"
 
 
-def combined_quarantine(*metadata_items: dict[str, object]) -> dict[str, object]:
-    summaries = [item.get("quarantine") for item in metadata_items if isinstance(item.get("quarantine"), dict)]
-    return {
-        "occurrences": sum(int_metadata(item, "occurrences") for item in summaries),
-        "new_events": sum(int_metadata(item, "new_events") for item in summaries),
-        "unacknowledged_events": sum(int_metadata(item, "unacknowledged_events") for item in summaries),
-        "acknowledged_occurrences": sum(int_metadata(item, "acknowledged_occurrences") for item in summaries),
-        "event_ids": sorted({str(value) for item in summaries for value in item.get("event_ids", [])}),
-        "event_ids_truncated": any(bool(item.get("event_ids_truncated")) for item in summaries),
-    }
+def child_contract_failure(result: ProcessResult, *, operation: str) -> PipelineResult | None:
+    error = required_json_contract_error(result, operation=operation)
+    if error is None:
+        return None
+    return PipelineResult(exit_code=2, payload=error, process_output=result)
 
 
 def run_pipeline(options: PipelineOptions, dependencies: PipelineDependencies) -> PipelineResult:
@@ -76,6 +73,7 @@ def run_pipeline(options: PipelineOptions, dependencies: PipelineDependencies) -
     }
     effective_output = str(dependencies.output_path(str(paths.codex_dir), str(paths.output_dir)))
     with service_lock.acquire_service_lock(reason="pipeline", output_dir=paths.output_dir) as lock:
+        dashboard_cleanup_recovery.recover_retention_cleanup(paths.output_dir)
         child_env = service_lock.child_lock_env(env, lock.path, lock.fd)
         build_args: list[str] = []
         if options.state_db:
@@ -88,10 +86,13 @@ def run_pipeline(options: PipelineOptions, dependencies: PipelineDependencies) -
         degraded = False
         if options.recover:
             reconcile = dependencies.run_command(RuntimeCommand.RECONCILE, [], child_env)
-            reconcile_metadata = reconcile.payload or {}
             reconcile_degraded = completed_degraded(reconcile)
             if reconcile.exit_code != 0 and not reconcile_degraded:
                 return PipelineResult(exit_code=reconcile.exit_code, process_output=reconcile)
+            contract_failure = child_contract_failure(reconcile, operation="reconcile")
+            if contract_failure is not None:
+                return contract_failure
+            reconcile_metadata = reconcile.payload or {}
             degraded = degraded or reconcile_degraded
             cancel_control.check_cancelled("pipeline", "after-reconcile")
 
@@ -100,13 +101,16 @@ def run_pipeline(options: PipelineOptions, dependencies: PipelineDependencies) -
             cancel_control.check_cancelled("pipeline", "before-rotate")
             progress_control.write_progress(phase="normalize", phase_index=0, checkpoint="rotate-current", phase_progress=0.02)
             rotation = dependencies.run_command(RuntimeCommand.COMPACT, ["--rotate-current"], child_env)
-            pre_analysis_rotate = rotation.payload or {}
             if rotation.exit_code != 0:
                 return PipelineResult(
                     exit_code=rotation.exit_code,
-                    payload={"error": "rotation failed", "pre_analysis_rotate": pre_analysis_rotate},
+                    payload={"error": "rotation failed", "pre_analysis_rotate": rotation.payload or {}},
                     process_output=rotation,
                 )
+            contract_failure = child_contract_failure(rotation, operation="compact")
+            if contract_failure is not None:
+                return contract_failure
+            pre_analysis_rotate = rotation.payload or {}
         cancel_control.check_cancelled("pipeline", "after-rotate")
         progress_control.write_progress(phase="normalize", phase_index=0, checkpoint="after-rotate", phase_progress=0.05)
 
@@ -122,6 +126,9 @@ def run_pipeline(options: PipelineOptions, dependencies: PipelineDependencies) -
         normalize_degraded = completed_degraded(normalize)
         if normalize.exit_code != 0 and not normalize_degraded:
             return PipelineResult(exit_code=normalize.exit_code, process_output=normalize)
+        contract_failure = child_contract_failure(normalize, operation="normalize")
+        if contract_failure is not None:
+            return contract_failure
         degraded = degraded or normalize_degraded
         cancel_control.check_cancelled("pipeline", "after-normalize")
         progress_control.write_progress(phase="build", phase_index=1, checkpoint="after-normalize", phase_progress=0.0)
@@ -146,13 +153,16 @@ def run_pipeline(options: PipelineOptions, dependencies: PipelineDependencies) -
             )
         if build.exit_code != 0:
             return PipelineResult(exit_code=build.exit_code, process_output=build)
+        contract_failure = child_contract_failure(build, operation="build")
+        if contract_failure is not None:
+            return contract_failure
         if rebuild_reasons:
             build_metadata["analysis_rebuild_reason"] = ",".join(rebuild_reasons)
 
         retention_recovery = dashboard_cleanup.complete_retention_derived_rebuild(paths.output_dir)
         payload = {
             "status": "degraded" if degraded else "healthy",
-            "quarantine": combined_quarantine(reconcile_metadata, normalize_metadata),
+            "quarantine": quarantine_health.merge_operation_summaries(reconcile_metadata, normalize_metadata),
             "reconcile": reconcile_metadata,
             "normalize": normalize_metadata,
             **build_metadata,

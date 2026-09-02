@@ -18,9 +18,10 @@ raw/
 reports/
 state/
 tmp/
-reviews/tmp/
+/reviews/tmp/
 /handoffs/
 *.jsonl
+!/reviews/issues/*.jsonl
 *.sqlite
 *.sqlite-*
 

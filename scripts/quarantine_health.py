@@ -290,6 +290,20 @@ def record_event(
     return result
 
 
+def record_unavailable(base: pathlib.Path, row: dict[str, Any]) -> dict[str, Any]:
+    event, evidence_path, captured_at_ns = turn_resolution.write_unavailable_evidence(base, row)
+    row["token_resolution_event_id"] = event
+    return record_event(
+        base,
+        event=event,
+        kind=turn_resolution.UNAVAILABLE_KIND,
+        source=str(row.get("transcript_path") or "unknown"),
+        error=str(row.get("token_resolution_reason") or "unknown"),
+        evidence_path=evidence_path,
+        captured_at_ns=captured_at_ns,
+    )
+
+
 def operation_summary(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
     items = list(results)
     unacknowledged = {str(item["event_id"]) for item in items if not item.get("acknowledged")}
@@ -300,6 +314,35 @@ def operation_summary(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "acknowledged_occurrences": sum(1 for item in items if item.get("acknowledged")),
         "event_ids": sorted(unacknowledged)[:20],
         "event_ids_truncated": len(unacknowledged) > 20,
+    }
+
+
+def merge_operation_summaries(*metadata_items: dict[str, Any]) -> dict[str, Any]:
+    summaries = [item.get("quarantine") for item in metadata_items if isinstance(item.get("quarantine"), dict)]
+    event_ids = sorted(
+        {
+            str(event)
+            for summary in summaries
+            for event in (summary.get("event_ids") if isinstance(summary.get("event_ids"), list) else [])
+        }
+    )
+
+    def total(key: str) -> int:
+        value = 0
+        for summary in summaries:
+            try:
+                value += int(summary.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+        return value
+
+    return {
+        "occurrences": total("occurrences"),
+        "new_events": total("new_events"),
+        "unacknowledged_events": total("unacknowledged_events"),
+        "acknowledged_occurrences": total("acknowledged_occurrences"),
+        "event_ids": event_ids[:20],
+        "event_ids_truncated": len(event_ids) > 20 or any(bool(summary.get("event_ids_truncated")) for summary in summaries),
     }
 
 

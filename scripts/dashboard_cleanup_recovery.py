@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import sys
@@ -90,6 +91,19 @@ def retention_job_requires_derived_rebuild(job: RetentionJob | Mapping[str, Any]
     return retention_job_model(job).requires_derived_rebuild
 
 
+def manifest_segments_sha256(manifest: Mapping[str, Any]) -> str:
+    segments = manifest.get("segments")
+    if not isinstance(segments, list):
+        raise raw_segments.ManifestError("raw segment manifest must contain a segment list")
+    encoded = json.dumps(
+        segments,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def recover_ready_pruned_turn_state(base: pathlib.Path, job: RetentionJob) -> RetentionJob:
     pruned_state_job_id = job.pruned_state_job_id or ""
     if job.pruned_state_commit_ready is not True or not pruned_state_job_id:
@@ -105,6 +119,48 @@ def recover_ready_pruned_turn_state(base: pathlib.Path, job: RetentionJob) -> Re
     )
     write_cleanup_retention_job(base, updated)
     return updated
+
+
+def recover_interrupted_pruned_turn_state(base: pathlib.Path, job: RetentionJob) -> RetentionJob:
+    if job.pruned_state_commit_ready is True:
+        return recover_ready_pruned_turn_state(base, job)
+    pruned_state_job_id = job.pruned_state_job_id or ""
+    if not pruned_state_job_id:
+        return job
+    before_sha256 = job.raw_segments_before_sha256
+    after_sha256 = job.raw_segments_after_sha256
+    if not before_sha256 or not after_sha256:
+        raise raw_segments.ManifestError("cannot classify interrupted retention attribution without raw manifest identities")
+    current_sha256 = manifest_segments_sha256(raw_segments.strict_read_manifest(base))
+    if current_sha256 == after_sha256:
+        try:
+            retention_pruned_store.commit_stage(base, pruned_state_job_id)
+        except retention_pruned_store.RetentionPrunedStoreError as exc:
+            raise raw_segments.ManifestError(f"cannot recover retention pruned turn state: {exc}") from exc
+        updated = job.transition(
+            job.phase,
+            clear_fields=("pruned_state_job_id", "pruned_state_commit_ready"),
+            pruned_state_commit_recovered=True,
+        )
+        write_cleanup_retention_job(base, updated)
+        return updated
+    if current_sha256 == before_sha256:
+        try:
+            retention_pruned_store.discard_stage(base, pruned_state_job_id)
+        except retention_pruned_store.RetentionPrunedStoreError as exc:
+            raise raw_segments.ManifestError(f"cannot discard interrupted retention pruned turn state: {exc}") from exc
+        updated = job.transition(
+            RetentionPhase.FAILED,
+            clear_fields=("pruned_state_job_id", "pruned_state_commit_ready"),
+            failed_stage="apply_recovery",
+            physical_delete_pending=False,
+            pending_files=0,
+            derived_rebuild_required=True,
+            recovery_required=True,
+        )
+        write_cleanup_retention_job(base, updated)
+        return updated
+    raise raw_segments.ManifestError("cannot classify interrupted retention attribution from the current raw manifest")
 
 
 def complete_retention_derived_rebuild(base: pathlib.Path | str) -> dict[str, Any]:
@@ -142,7 +198,7 @@ def recover_retention_cleanup(base: pathlib.Path | str) -> dict[str, Any]:
             raise raw_segments.ManifestError(f"cannot discard interrupted retention state: {exc}") from exc
         clear_cleanup_retention_job(root)
         return {"raw_sweep": sweep, "job": None, "recovered_phase": job.phase.value}
-    job = recover_ready_pruned_turn_state(root, job)
+    job = recover_interrupted_pruned_turn_state(root, job)
     if int(sweep.get("pending_files") or 0) > 0:
         job = job.transition(
             RetentionPhase.PHYSICAL_DELETE_PENDING,
@@ -151,6 +207,24 @@ def recover_retention_cleanup(base: pathlib.Path | str) -> dict[str, Any]:
             unlink_errors=sweep.get("errors") or [],
         )
         write_cleanup_retention_job(root, job)
+    elif job.phase is RetentionPhase.PLANNED and job.pruned_state_commit_recovered is True:
+        job = job.transition(
+            RetentionPhase.LOGICAL_DELETE_COMMITTED,
+            physical_delete_pending=False,
+            pending_files=0,
+        )
+        write_cleanup_retention_job(root, job)
+    elif job.physical_delete_pending is True:
+        if retention_job_requires_derived_rebuild(job):
+            job = job.transition(
+                RetentionPhase.DERIVED_REBUILD_REQUIRED,
+                clear_fields=("failed_stage", "unlink_errors"),
+                physical_delete_pending=False,
+                pending_files=0,
+            )
+            write_cleanup_retention_job(root, job)
+        else:
+            clear_cleanup_retention_job(root)
     elif job.phase in {RetentionPhase.PHYSICAL_DELETE_PENDING, RetentionPhase.COMPLETE}:
         if retention_job_requires_derived_rebuild(job):
             job = job.transition(

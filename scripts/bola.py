@@ -9,7 +9,6 @@ import os
 import pathlib
 import shlex
 import shutil
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -31,6 +30,7 @@ import cancel_control
 import progress_control  # noqa: F401 - compatibility patch point for command tests
 import raw_segments  # noqa: F401 - compatibility facade for command tests and integrations
 import analysis_inputs
+import analytics_metadata
 import quarantine_health
 import quarantine_renderer
 import retention_checkpoints
@@ -366,26 +366,6 @@ def completed_degraded(returncode: int, metadata: dict[str, object]) -> bool:
     return returncode == 1 and metadata.get("status") == "degraded"
 
 
-def combined_quarantine(*metadata_items: dict[str, object]) -> dict[str, object]:
-    summaries = [item.get("quarantine") for item in metadata_items if isinstance(item.get("quarantine"), dict)]
-    event_ids = sorted(
-        {
-            str(event)
-            for summary in summaries
-            if isinstance(summary, dict)
-            for event in (summary.get("event_ids") if isinstance(summary.get("event_ids"), list) else [])
-        }
-    )
-    return {
-        "occurrences": sum(int(summary.get("occurrences") or 0) for summary in summaries if isinstance(summary, dict)),
-        "new_events": sum(int(summary.get("new_events") or 0) for summary in summaries if isinstance(summary, dict)),
-        "unacknowledged_events": sum(int(summary.get("unacknowledged_events") or 0) for summary in summaries if isinstance(summary, dict)),
-        "acknowledged_occurrences": sum(int(summary.get("acknowledged_occurrences") or 0) for summary in summaries if isinstance(summary, dict)),
-        "event_ids": event_ids[:20],
-        "event_ids_truncated": len(event_ids) > 20 or any(bool(summary.get("event_ids_truncated")) for summary in summaries if isinstance(summary, dict)),
-    }
-
-
 def runtime_paths(
     codex_dir: str | pathlib.Path | None = None,
     output_dir: str | pathlib.Path | None = None,
@@ -444,23 +424,7 @@ restore_raw_segment_state_checkpoint = retention_checkpoints.restore
 
 def read_analytics_metadata(output: str | None) -> dict[str, object]:
     db_path = pathlib.Path(output).expanduser() if output else analytics_db_path()
-    if not db_path.exists():
-        return {}
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    try:
-        try:
-            rows = con.execute("select key, value from run_metadata").fetchall()
-        except sqlite3.Error:
-            return {}
-        metadata: dict[str, object] = {}
-        for key, value in rows:
-            try:
-                metadata[str(key)] = json.loads(value)
-            except (TypeError, json.JSONDecodeError):
-                metadata[str(key)] = value
-        return metadata
-    finally:
-        con.close()
+    return analytics_metadata.read_run_metadata(db_path)
 
 
 sha256_file = paths_service.sha256_file
@@ -667,12 +631,11 @@ def path_set_dependencies() -> paths_service.PathsSetDependencies:
     )
 
 
-def migration_dependencies(*, adapter_callbacks: bool = False) -> paths_service.MigrationDependencies:
+def migration_dependencies() -> paths_service.MigrationDependencies:
     return paths_service.MigrationDependencies(
         run_command=run_typed_script_json,
         resolve_physical_deletes=resolve_source_physical_deletes,
-        preview_migration=output_migration_preview if adapter_callbacks else None,
-        apply_migration=apply_output_migration if adapter_callbacks else None,
+        recover_retention_cleanup=dashboard_cleanup.recover_retention_cleanup,
     )
 
 
@@ -708,7 +671,7 @@ def paths_migrate(args: argparse.Namespace) -> int:
             output_dir=bool(getattr(args, "output_dir", False)),
             apply=bool(getattr(args, "apply", False)),
         ),
-        migration_dependencies(adapter_callbacks=True),
+        migration_dependencies(),
     )
     print(json.dumps(result.payload, ensure_ascii=False, separators=(",", ":")))
     return result.exit_code

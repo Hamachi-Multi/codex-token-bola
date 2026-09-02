@@ -9,6 +9,37 @@ except ModuleNotFoundError:
 
 
 class QuarantineHealthTests(unittest.TestCase):
+    def test_operation_summary_merge_is_bounded_and_reports_truncation(self) -> None:
+        health = load_module("quarantine_summary_merge_test", ROOT / "scripts" / "quarantine_health.py")
+        summaries = []
+        for prefix in ("a", "b"):
+            summaries.append(
+                {
+                    "quarantine": {
+                        "occurrences": 20,
+                        "new_events": 20,
+                        "unacknowledged_events": 20,
+                        "acknowledged_occurrences": 0,
+                        "event_ids": [f"{prefix}{index:02}" for index in range(20)],
+                        "event_ids_truncated": False,
+                    }
+                }
+            )
+
+        merged = health.merge_operation_summaries(*summaries)
+
+        self.assertEqual(len(merged["event_ids"]), 20)
+        self.assertTrue(merged["event_ids_truncated"])
+        self.assertEqual(merged["occurrences"], 40)
+
+    def test_operation_summary_merge_preserves_input_truncation(self) -> None:
+        health = load_module("quarantine_summary_input_truncation_test", ROOT / "scripts" / "quarantine_health.py")
+        merged = health.merge_operation_summaries(
+            {"quarantine": {"event_ids": ["a"], "event_ids_truncated": True}}
+        )
+        self.assertEqual(merged["event_ids"], ["a"])
+        self.assertTrue(merged["event_ids_truncated"])
+
     def test_event_is_deduplicated_and_acknowledgement_survives_repeat(self) -> None:
         health = load_module("quarantine_health_registry_test", ROOT / "scripts" / "quarantine_health.py")
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -233,7 +264,7 @@ class QuarantineHealthTests(unittest.TestCase):
                 if name == "normalize.py":
                     return 1, {"status": "degraded", "mode": "incremental", "normalized_turns_size": 0, "quarantine": {"occurrences": 1, "new_events": 1, "unacknowledged_events": 1, "acknowledged_occurrences": 0, "event_ids": ["n"]}}, "", ""
                 if name == "compact_raw.py":
-                    return 0, {}, "", ""
+                    return 0, {}, "{}", ""
                 if name == "build_analytics.py":
                     return 0, {"turn_rows": 2}, "", ""
                 raise AssertionError(name)
@@ -614,6 +645,70 @@ class QuarantineHealthTests(unittest.TestCase):
         self.assertTrue(captured["data"]["ok"])
         self.assertEqual(captured["data"]["data_health"], "degraded")
         self.assertEqual(captured["data"]["quarantine"]["unacknowledged_events"], 1)
+
+    def test_dashboard_rejects_successful_pipeline_without_json_result(self) -> None:
+        serve = load_module("dashboard_rebuild_result_contract_test", ROOT / "scripts" / "serve_dashboard.py")
+        rebuild = serve.dashboard_rebuild_api
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = pathlib.Path(tmp_dir)
+            captured: dict[str, object] = {}
+            manager = rebuild.operation_state.DashboardOperationManager()
+            operation_id = "11111111-1111-4111-8111-111111111111"
+
+            class Handler(rebuild.DashboardRebuildApiMixin):
+                def dashboard_operation_manager(self):
+                    return manager
+
+                @staticmethod
+                def read_json_body():
+                    return {"operation_id": operation_id}
+
+                def dashboard_output_dir(self):
+                    return base
+
+                def dashboard_script_dir(self):
+                    return ROOT / "scripts"
+
+                def dashboard_codex_dir(self):
+                    return base / "codex"
+
+                @staticmethod
+                def int_metadata(metadata, key):
+                    return int(metadata.get(key) or 0)
+
+                @staticmethod
+                def numeric_metadata(metadata, key):
+                    return float(metadata.get(key) or 0)
+
+                def send_json(self, data, status=200):
+                    captured["data"] = data
+                    captured["status"] = status
+
+            class Process:
+                returncode = 0
+
+                def poll(self):
+                    return self.returncode
+
+                def wait(self, timeout=None):
+                    return self.returncode
+
+            def fake_popen(*args, **kwargs):
+                kwargs["stdout"].write("log only\n")
+                kwargs["stdout"].flush()
+                return Process()
+
+            with (
+                mock.patch.object(rebuild.dashboard_managed_process.ManagedProcess, "start", side_effect=fake_popen),
+                mock.patch.object(rebuild.dashboard_cleanup, "refresh_retention_index_for_current_sources") as refresh,
+            ):
+                Handler().handle_rebuild()
+
+        self.assertEqual(captured["status"], 500)
+        self.assertEqual(captured["data"]["error"], "child_output_contract_failed")
+        self.assertEqual(captured["data"]["operation"], "analysis")
+        self.assertEqual(captured["data"]["parse_error"], "json_object_missing")
+        refresh.assert_not_called()
 
 
 if __name__ == "__main__":

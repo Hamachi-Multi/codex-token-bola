@@ -513,7 +513,7 @@ class DashboardCleanupUiTests(DashboardFixtureMixin, unittest.TestCase):
     def test_cleanup_ui_clears_stale_status_and_wraps_mobile_modal(self) -> None:
         source = dashboard_asset_bundle()
         self.assertIn("error.status = res.status;", source)
-        self.assertIn("error.code = parsed.error || '';", source)
+        self.assertIn("error.code = data.error || '';", source)
         self.assertIn("function isServiceBusyError(err)", source)
         self.assertIn("function clearCleanupStatus()", source)
         self.assertIn("if (!options.keepStatus) clearCleanupStatus();", source)

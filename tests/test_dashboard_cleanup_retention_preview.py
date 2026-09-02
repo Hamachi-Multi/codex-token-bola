@@ -489,6 +489,55 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
 
         self.assertEqual(actual, expected)
 
+    def test_retention_preview_with_signature_retries_after_append(self) -> None:
+        cleanup = load_module("cleanup_stable_preview_append_test", ROOT / "scripts" / "dashboard_cleanup.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = pathlib.Path(tmp_dir) / "token-usage"
+            current = cleanup._preview.raw_segments.ensure_current_segment(
+                base,
+                kind="prompt_usage",
+                source_name="prompt-usage.raw.jsonl",
+            )
+            current_path = pathlib.Path(str(current["path"]))
+            current_path.write_text(
+                json.dumps(_turn_raw("s1", "old", 100) | {"captured_at": "2026-01-01T00:00:00Z"}) + "\n",
+                encoding="utf-8",
+            )
+            cutoff_unix = datetime.fromisoformat("2026-01-08T00:00:00+00:00").timestamp()
+            real_preview = cleanup._preview.retention_preview
+            preview_calls = 0
+
+            def preview_then_append(*args: object, **kwargs: object) -> dict[str, object]:
+                nonlocal preview_calls
+                preview_calls += 1
+                result = real_preview(*args, **kwargs)
+                if preview_calls == 1:
+                    with current_path.open("a", encoding="utf-8") as handle:
+                        handle.write(
+                            json.dumps(_turn_raw("s1", "older", 100) | {"captured_at": "2026-01-02T00:00:00Z"})
+                            + "\n"
+                        )
+                return result
+
+            with mock.patch.object(cleanup._preview, "retention_preview", side_effect=preview_then_append):
+                preview = cleanup.retention_preview_with_signature(base, cutoff_unix, refresh_index=False)
+            expected_signature = cleanup.retention_preview_signature(base, cutoff_unix)
+
+        self.assertEqual(preview_calls, 2)
+        self.assertEqual(preview["deletable_rows"], 2)
+        self.assertEqual(preview["preview_signature"], expected_signature)
+
+    def test_retention_preview_with_signature_rejects_continuous_changes(self) -> None:
+        cleanup = load_module("cleanup_unstable_preview_test", ROOT / "scripts" / "dashboard_cleanup.py")
+        with (
+            mock.patch.object(cleanup._preview, "retention_preview_signature", side_effect=["a", "b", "c", "d"]),
+            mock.patch.object(cleanup._preview, "retention_preview", return_value={"deletable_rows": 1}) as preview_call,
+        ):
+            with self.assertRaisesRegex(cleanup.RetentionPreviewStale, "changed while it was calculated"):
+                cleanup.retention_preview_with_signature(pathlib.Path("/tmp/unstable"), 1.0)
+
+        self.assertEqual(preview_call.call_count, 2)
+
     def test_retention_preview_uses_manifest_segment_bounds_without_rescanning_gzip(self) -> None:
         cleanup = load_module("cleanup_segment_preview_test", ROOT / "scripts" / "dashboard_cleanup.py")
         raw_segments = load_module("raw_segments_preview_test", ROOT / "scripts" / "raw_segments.py")

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import pathlib
 import subprocess
 import sys
 import tempfile
@@ -17,6 +16,7 @@ import dashboard_operation_state as operation_state
 import progress_control
 import service_lock
 import service_paths
+from runtime_command_runner import process_result_from_output, required_json_contract_error
 
 
 AUTO_COMPACT_MIN_BYTES = 64 * 1024 * 1024
@@ -37,6 +37,15 @@ def terminate_rebuild_process(process, grace_seconds: float = 2.0) -> str:
         return "killed"
 
 
+def rebuild_was_cancelled(result, *, cancel_enforced: bool) -> bool:
+    metadata = result.payload or {}
+    return (
+        result.exit_code == cancel_control.CANCEL_EXIT_CODE
+        or bool(metadata.get("cancelled"))
+        or cancel_enforced
+    )
+
+
 class DashboardRebuildApiMixin:
     @staticmethod
     def canonical_operation_id(value) -> str | None:
@@ -49,12 +58,6 @@ class DashboardRebuildApiMixin:
         canonical = str(parsed)
         return canonical if value == canonical else None
 
-    def _dashboard_db_path(self) -> pathlib.Path:
-        resolver = getattr(self, "dashboard_db_path", None)
-        if callable(resolver):
-            return pathlib.Path(resolver())
-        return pathlib.Path(self.server.db_path)
-
     def handle_rebuild(self):
         operation_id = self.canonical_operation_id(self.read_json_body().get("operation_id"))
         if operation_id is None:
@@ -62,7 +65,12 @@ class DashboardRebuildApiMixin:
             return
         manager = self.dashboard_operation_manager()
         try:
-            lease = manager.begin("analysis", self.dashboard_output_dir(), operation_id=operation_id)
+            starter = getattr(self, "begin_dashboard_operation", None)
+            lease = (
+                starter("analysis", operation_id=operation_id)
+                if callable(starter)
+                else manager.begin("analysis", self.dashboard_output_dir(), operation_id=operation_id)
+            )
         except operation_state.ServerShuttingDown:
             self.send_json({"error": "server_shutting_down"}, 503)
             return
@@ -119,6 +127,7 @@ class DashboardRebuildApiMixin:
                     cancel_control.request_cancel(cancel_file, reason="user")
                 try:
                     cancel_requested_at: float | None = None
+                    cancel_enforced = False
                     while process.poll() is None:
                         active = manager.active_record()
                         cancel_requested = bool(
@@ -141,14 +150,15 @@ class DashboardRebuildApiMixin:
                                 )
                             elif time.monotonic() - cancel_requested_at >= 2.0:
                                 status = terminate_rebuild_process(process)
+                                cancel_enforced = status in {"terminated", "killed"}
                                 progress_control.write_progress_to_path(
                                     progress_file,
                                     operation_id=operation_id,
-                                    status="cancelled",
+                                    status="cancelled" if cancel_enforced else "running",
                                     phase="cancel",
                                     phase_index=1,
-                                    checkpoint=status,
-                                    phase_progress=1.0,
+                                    checkpoint=status if cancel_enforced else "cancel_too_late",
+                                    phase_progress=1.0 if cancel_enforced else 0.0,
                                 )
                                 break
                         time.sleep(0.1)
@@ -161,13 +171,10 @@ class DashboardRebuildApiMixin:
                     manager.detach_process(operation_id, process)
             stdout = (stdout or "").strip()
             stderr = (stderr or "").strip()
-            metadata = self.parse_last_json(stdout)
-            degraded = process.returncode == 1 and metadata.get("status") == "degraded"
-            if (
-                process.returncode == cancel_control.CANCEL_EXIT_CODE
-                or bool(metadata.get("cancelled"))
-                or cancel_requested_at is not None
-            ):
+            result = process_result_from_output("analysis", int(process.returncode or 0), stdout, stderr)
+            metadata = result.payload or {}
+            degraded = result.exit_code == 1 and metadata.get("status") == "degraded"
+            if rebuild_was_cancelled(result, cancel_enforced=cancel_enforced):
                 progress_control.write_progress_to_path(
                     progress_file,
                     operation_id=operation_id,
@@ -182,12 +189,12 @@ class DashboardRebuildApiMixin:
                         "ok": False,
                         "cancelled": True,
                         **metadata,
-                        "returncode": process.returncode,
+                        "returncode": result.exit_code,
                         "elapsed_ms": round((time.monotonic() - started) * 1000),
                     }
                 )
                 return
-            if process.returncode != 0 and not degraded:
+            if result.exit_code != 0 and not degraded:
                 progress_control.write_progress_to_path(
                     progress_file,
                     operation_id=operation_id,
@@ -200,7 +207,7 @@ class DashboardRebuildApiMixin:
                     self.send_json(
                         {
                             **operation_state.service_busy_payload(lock_path=metadata.get("lock_path")),
-                            "returncode": process.returncode,
+                            "returncode": result.exit_code,
                         },
                         409,
                     )
@@ -209,7 +216,7 @@ class DashboardRebuildApiMixin:
                     self.send_json(
                         {
                             "error": "normalize_pending_publish_recovery_failed",
-                            "returncode": process.returncode,
+                            "returncode": result.exit_code,
                             "message": metadata.get("message"),
                             "marker_path": metadata.get("marker_path"),
                             "recovery_required": bool(metadata.get("recovery_required")),
@@ -220,12 +227,24 @@ class DashboardRebuildApiMixin:
                 self.send_json(
                     {
                         "error": "rebuild_failed",
-                        "returncode": process.returncode,
+                        "returncode": result.exit_code,
                         "stderr": stderr[-4000:],
                         "stdout": stdout[-4000:],
                     },
                     500,
                 )
+                return
+            contract_error = required_json_contract_error(result, operation="analysis")
+            if contract_error is not None:
+                progress_control.write_progress_to_path(
+                    progress_file,
+                    operation_id=operation_id,
+                    status="failed",
+                    phase="failed",
+                    phase_index=0,
+                    checkpoint="result-contract",
+                )
+                self.send_json(contract_error, 500)
                 return
             if "elapsed_ms" in metadata:
                 metadata["analysis_elapsed_ms"] = metadata.pop("elapsed_ms")

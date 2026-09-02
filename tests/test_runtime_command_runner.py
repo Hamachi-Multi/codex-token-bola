@@ -18,6 +18,30 @@ class RuntimeCommandRunnerTests(unittest.TestCase):
         self.assertEqual(runner.parse_last_json_object(""), (None, "stdout_empty"))
         self.assertEqual(runner.parse_last_json_object("noise\n[]\n"), (None, "json_object_missing"))
 
+    def test_process_result_from_output_preserves_parse_failure(self) -> None:
+        result = runner.process_result_from_output("analysis", 0, "noise\n[]\n", "warning")
+
+        self.assertEqual(result.command, "analysis")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIsNone(result.payload)
+        self.assertEqual(result.parse_error, "json_object_missing")
+        self.assertEqual(
+            runner.required_json_contract_error(result, operation="analysis"),
+            {
+                "error": "child_output_contract_failed",
+                "operation": "analysis",
+                "parse_error": "json_object_missing",
+                "returncode": 0,
+                "result_unknown": True,
+            },
+        )
+
+    def test_required_json_contract_accepts_empty_object(self) -> None:
+        result = runner.process_result_from_output("compact", 0, "{}\n", "")
+
+        self.assertEqual(result.payload, {})
+        self.assertIsNone(runner.required_json_contract_error(result, operation="compact"))
+
     def test_runner_captures_process_contract_and_lock_fds(self) -> None:
         completed = mock.Mock(returncode=1, stdout='log\n{"status":"degraded"}\n', stderr="warning\n")
         command_runner = runner.SubprocessRuntimeCommandRunner(ROOT / "scripts", "/python")

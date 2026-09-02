@@ -3,9 +3,9 @@ from __future__ import annotations
 import typing
 
 try:
-    from tests.support import json, pathlib, tempfile, unittest
+    from tests.support import json, mock, pathlib, tempfile, unittest
 except ModuleNotFoundError:
-    from support import json, pathlib, tempfile, unittest
+    from support import json, mock, pathlib, tempfile, unittest
 
 from scripts import service_paths
 
@@ -115,6 +115,27 @@ class PathTransitionTests(unittest.TestCase):
 
         self.assertIsInstance(payload, dict)
         self.assertEqual(payload, stored)
+
+    def test_transition_replace_and_unlink_fsync_parent_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "path-transition.json"
+            transition = self.transition(pathlib.Path(tmp) / "source", pathlib.Path(tmp) / "active").mark_pending()
+            with mock.patch.object(service_paths.atomic_io, "fsync_directory") as fsync_directory:
+                service_paths.write_path_transition(transition, path)
+                service_paths.clear_path_transition(path)
+
+        self.assertEqual(fsync_directory.call_args_list, [mock.call(path.parent), mock.call(path.parent)])
+
+    def test_config_replace_propagates_directory_fsync_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "runtime.conf"
+            with (
+                mock.patch.object(service_paths.atomic_io, "fsync_directory", side_effect=OSError("fsync failed")),
+                self.assertRaisesRegex(OSError, "fsync failed"),
+            ):
+                service_paths.write_config({"codex_dir": "/tmp/codex", "output_dir": "/tmp/output"}, path)
+
+            self.assertTrue(path.exists())
 
 
 if __name__ == "__main__":

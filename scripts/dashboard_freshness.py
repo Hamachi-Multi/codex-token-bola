@@ -6,7 +6,6 @@ import gzip
 import hashlib
 import json
 import pathlib
-import sqlite3
 import sys
 import threading
 from collections import OrderedDict
@@ -18,10 +17,11 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import transcript_parser
+import analytics_metadata
 import cost_rates
+from normalize_contract import NORMALIZE_LOGIC_VERSION
 import turn_lifecycle
 
-NORMALIZE_LOGIC_VERSION = 5
 RECOVERY_RECORD_TYPES = {"turn_start", "turn_stop_missing_start"}
 TURN_START_RECOVERY_AGE_SECONDS = 60
 RECOVERY_TRANSCRIPT_CACHE_LIMIT = 128
@@ -316,24 +316,7 @@ def _pending_sources(base: pathlib.Path, state: dict[str, Any] | None = None) ->
 
 
 def _run_metadata(db_path: pathlib.Path) -> dict[str, Any]:
-    if not db_path.is_file():
-        return {}
-    con: sqlite3.Connection | None = None
-    try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        rows = con.execute("select key, value from run_metadata").fetchall()
-    except sqlite3.Error:
-        return {}
-    finally:
-        if con is not None:
-            con.close()
-    metadata: dict[str, Any] = {}
-    for key, value in rows:
-        try:
-            metadata[str(key)] = json.loads(value)
-        except (TypeError, json.JSONDecodeError):
-            metadata[str(key)] = value
-    return metadata
+    return analytics_metadata.read_run_metadata(db_path)
 
 
 def _pending_normalized_rows(base: pathlib.Path, db_path: pathlib.Path, warnings: list[dict[str, str]] | None = None) -> int:

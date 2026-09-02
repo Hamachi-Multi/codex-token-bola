@@ -98,31 +98,48 @@ class DashboardRuntimeManager:
         self._lease = DashboardServerLease.acquire(runtime_paths.output_dir, self.server_id)
         dashboard_operation_state.sweep_transient_progress_files(runtime_paths.output_dir)
 
+    def _adopt_resolved_paths_locked(self, resolved: service_paths.RuntimePaths) -> service_paths.RuntimePaths:
+        current = self._runtime_paths
+        if resolved == current:
+            return current
+        if self.operation_manager.has_active_operation():
+            raise DashboardPathTransitionBusy("runtime paths changed while a dashboard operation is active")
+        if resolved.output_dir == current.output_dir:
+            self._runtime_paths = resolved
+            return resolved
+        try:
+            next_lease = DashboardServerLease.acquire(resolved.output_dir, self.server_id)
+        except DashboardServerBusy as exc:
+            raise DashboardOutputConflict(exc.path) from exc
+        dashboard_operation_state.sweep_transient_progress_files(resolved.output_dir)
+        previous_lease = self._lease
+        self._runtime_paths = resolved
+        self._lease = next_lease
+        previous_lease.close()
+        return resolved
+
     def snapshot(self) -> service_paths.RuntimePaths:
         if not self.dynamic:
             with self._lock:
                 return self._runtime_paths
-        with service_paths.acquire_path_lock():
-            resolved = service_paths.resolve_runtime_paths()
-        with self._lock:
-            current = self._runtime_paths
-            if resolved == current:
-                return current
-            if self.operation_manager.has_active_operation():
-                raise DashboardPathTransitionBusy("runtime paths changed while a dashboard operation is active")
-            if resolved.output_dir == current.output_dir:
-                self._runtime_paths = resolved
-                return resolved
-            try:
-                next_lease = DashboardServerLease.acquire(resolved.output_dir, self.server_id)
-            except DashboardServerBusy as exc:
-                raise DashboardOutputConflict(exc.path) from exc
-            dashboard_operation_state.sweep_transient_progress_files(resolved.output_dir)
-            previous_lease = self._lease
-            self._runtime_paths = resolved
-            self._lease = next_lease
-            previous_lease.close()
-            return resolved
+        with service_paths.acquire_path_lock(), self._lock:
+            return self._adopt_resolved_paths_locked(service_paths.resolve_runtime_paths())
+
+    def begin_operation(
+        self,
+        kind: str,
+        *,
+        operation_id: str | None = None,
+    ) -> tuple[dashboard_operation_state.OperationLease, service_paths.RuntimePaths]:
+        if not self.dynamic:
+            with self._lock:
+                paths = self._runtime_paths
+                lease = self.operation_manager.begin(kind, paths.output_dir, operation_id=operation_id)
+                return lease, paths
+        with service_paths.acquire_path_lock(), self._lock:
+            paths = self._adopt_resolved_paths_locked(service_paths.resolve_runtime_paths())
+            lease = self.operation_manager.begin(kind, paths.output_dir, operation_id=operation_id)
+            return lease, paths
 
     def lifetime_lock_fd(self) -> int:
         with self._lock:
