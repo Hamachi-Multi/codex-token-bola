@@ -43,6 +43,8 @@ from playwright_dashboard_settings import check_cost_rate_settings
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_TIMEOUT_MS = 10_000
+MAX_HTTP_ERRORS = 10
+MAX_HTTP_ERROR_DETAIL_CHARS = 1_024
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,7 @@ class BrowserScenario:
 class PageDiagnostics:
     runtime_errors: list[str] = field(default_factory=list)
     inflight_requests: dict[int, str] = field(default_factory=dict)
+    http_errors: list[str] = field(default_factory=list)
 
 
 SCENARIOS = (
@@ -111,6 +114,26 @@ def safe_request_label(request) -> str:
     return f"{request.method} {parsed.path}{query}"
 
 
+def safe_http_error(response) -> str | None:
+    request = response.request
+    parsed = urllib.parse.urlsplit(request.url)
+    if response.status < 400 or not parsed.path.startswith("/api/"):
+        return None
+    detail_parts: list[str] = []
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        for key in ("error", "message"):
+            value = payload.get(key)
+            if isinstance(value, (str, int, float, bool)):
+                detail_parts.append(f"{key}={value}")
+    detail = " ".join(detail_parts)[:MAX_HTTP_ERROR_DETAIL_CHARS]
+    suffix = f" {detail}" if detail else ""
+    return f"{safe_request_label(request)} {response.status}{suffix}"
+
+
 def attach_page_diagnostics(page) -> PageDiagnostics:
     diagnostics = PageDiagnostics()
 
@@ -135,11 +158,19 @@ def attach_page_diagnostics(page) -> PageDiagnostics:
         failure = request.failure or "unknown failure"
         diagnostics.runtime_errors.append(f"requestfailed: {safe_request_label(request)} {failure}")
 
+    def on_response(response) -> None:
+        label = safe_http_error(response)
+        if label is None:
+            return
+        diagnostics.http_errors.append(label)
+        del diagnostics.http_errors[:-MAX_HTTP_ERRORS]
+
     page.on("pageerror", on_page_error)
     page.on("console", on_console)
     page.on("request", on_request)
     page.on("requestfinished", on_request_finished)
     page.on("requestfailed", on_request_failed)
+    page.on("response", on_response)
     return diagnostics
 
 
@@ -164,7 +195,12 @@ def page_failure_state(page, diagnostics: PageDiagnostics) -> str:
     except Exception as exc:
         state = {"unavailable": str(exc)}
     inflight = sorted(diagnostics.inflight_requests.values())
-    return f"state={state!r}\ninflight={inflight!r}\nruntime_errors={diagnostics.runtime_errors!r}"
+    return (
+        f"state={state!r}\n"
+        f"inflight={inflight!r}\n"
+        f"http_errors={diagnostics.http_errors!r}\n"
+        f"runtime_errors={diagnostics.runtime_errors!r}"
+    )
 
 
 def run_scenario(browser, scenario: BrowserScenario, base_url: str, *, iteration: int) -> str | None:

@@ -38,6 +38,7 @@ packages = [
   "codex_token_bola._runtime",
   "codex_token_bola._runtime.assets",
   "codex_token_bola._runtime.assets.dashboard",
+  "codex_token_bola._runtime.assets.dashboard.components",
   "codex_token_bola._runtime.assets.fonts",
 ]
 
@@ -47,6 +48,7 @@ packages = [
 [tool.setuptools.package-data]
 "codex_token_bola._runtime.assets" = ["*.css", "*.html", "*.js", "*.png"]
 "codex_token_bola._runtime.assets.dashboard" = ["*.js"]
+"codex_token_bola._runtime.assets.dashboard.components" = ["*.js"]
 "codex_token_bola._runtime.assets.fonts" = ["*.woff2"]
 
 [tool.setuptools_scm]

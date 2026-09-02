@@ -47,6 +47,7 @@ class TurnLifecycleTests(unittest.TestCase):
         self.assertTrue(snapshot["found"])
         self.assertEqual(snapshot["turn_status"], "completed")
         self.assertEqual(snapshot["event_count"], 2)
+        self.assertEqual(snapshot["usable_last_token_usage_count"], 2)
         self.assertEqual(snapshot["total_token_usage"]["total_tokens"], 10)
         self.assertEqual(accumulator.terminal_event["event_offset"], 40)
 
@@ -62,6 +63,20 @@ class TurnLifecycleTests(unittest.TestCase):
 
                 self.assertEqual(snapshot["turn_status"], "aborted")
                 self.assertEqual(turn_lifecycle.terminal_turn_event(events[-1])["type"], terminal_type)
+
+    def test_empty_token_info_is_not_usable_usage_evidence(self) -> None:
+        events = [
+            event({"type": "task_started", "turn_id": "t1"}),
+            event({"type": "token_count", "info": {}}),
+            event({"type": "task_complete", "turn_id": "t1"}),
+        ]
+
+        accumulator = turn_lifecycle.reduce_target_events(events, "t1", assume_active=False)
+        snapshot = turn_lifecycle.full_lifecycle_snapshot(accumulator, path="/tmp/rollout.jsonl")
+
+        self.assertEqual(snapshot["event_count"], 1)
+        self.assertEqual(snapshot["usable_last_token_usage_count"], 0)
+        self.assertEqual(snapshot["total_token_usage"]["total_tokens"], 0)
 
     def test_missing_start_and_terminal_are_distinct(self) -> None:
         missing_start = turn_lifecycle.reduce_target_events(

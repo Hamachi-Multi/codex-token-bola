@@ -90,6 +90,8 @@ _KNOWN_FIELDS = frozenset(
         "pruned_state_job_id",
         "pruned_state_commit_ready",
         "pruned_state_commit_recovered",
+        "raw_segments_before_sha256",
+        "raw_segments_after_sha256",
     }
 )
 
@@ -100,6 +102,13 @@ def _optional_string(payload: Mapping[str, Any], key: str) -> str | None:
         return None
     if not isinstance(value, str):
         raise RetentionJobValidationError(f"retention job field {key!r} must be a string")
+    return value
+
+
+def _optional_sha256(payload: Mapping[str, Any], key: str) -> str | None:
+    value = _optional_string(payload, key)
+    if value is not None and (len(value) != 64 or any(character not in "0123456789abcdef" for character in value)):
+        raise RetentionJobValidationError(f"retention job field {key!r} must be a lowercase SHA-256 digest")
     return value
 
 
@@ -146,6 +155,8 @@ class RetentionJob:
     pruned_state_job_id: str | None = None
     pruned_state_commit_ready: bool | None = None
     pruned_state_commit_recovered: bool | None = None
+    raw_segments_before_sha256: str | None = None
+    raw_segments_after_sha256: str | None = None
     extra: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
     _present_fields: frozenset[str] = field(default_factory=frozenset, repr=False, compare=False)
 
@@ -171,6 +182,8 @@ class RetentionJob:
             pruned_state_job_id=_optional_string(payload, "pruned_state_job_id"),
             pruned_state_commit_ready=_optional_bool(payload, "pruned_state_commit_ready"),
             pruned_state_commit_recovered=_optional_bool(payload, "pruned_state_commit_recovered"),
+            raw_segments_before_sha256=_optional_sha256(payload, "raw_segments_before_sha256"),
+            raw_segments_after_sha256=_optional_sha256(payload, "raw_segments_after_sha256"),
             extra={key: value for key, value in payload.items() if key not in _KNOWN_FIELDS},
             _present_fields=frozenset(key for key in payload if key in _KNOWN_FIELDS),
         )
@@ -215,6 +228,8 @@ class RetentionJob:
             "pruned_state_job_id",
             "pruned_state_commit_ready",
             "pruned_state_commit_recovered",
+            "raw_segments_before_sha256",
+            "raw_segments_after_sha256",
         ):
             value = getattr(self, key)
             if value is not None or key in self._present_fields:
@@ -246,6 +261,8 @@ class RetentionJob:
             raise RetentionJobValidationError("pruned_state_commit_ready requires pruned_state_job_id")
         if self.pruned_state_commit_recovered is True and self.pruned_state_commit_ready is True:
             raise RetentionJobValidationError("recovered pruned state cannot remain commit-ready")
+        if (self.raw_segments_before_sha256 is None) != (self.raw_segments_after_sha256 is None):
+            raise RetentionJobValidationError("retention raw manifest identities must be stored together")
 
         if self.physical_delete_pending is True:
             if self.pending_files is None or self.pending_files < 1:

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import os
+import pathlib
 import subprocess
 import sys
+import tempfile
 from unittest import mock
 
 try:
@@ -13,6 +16,11 @@ except ModuleNotFoundError:
 
 
 class PackagingMetadataTests(unittest.TestCase):
+    def fake_package_env(self, root: pathlib.Path) -> dict[str, str]:
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(root)
+        return env
+
     def test_pyproject_declares_installable_bola_package(self) -> None:
         text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
@@ -114,6 +122,69 @@ class PackagingMetadataTests(unittest.TestCase):
 
         self.assertEqual(module.stdout, runtime.stdout)
         self.assertRegex(module.stdout, r"^bola \S+\n$")
+
+    def test_source_facades_fall_back_only_when_bundled_runtime_is_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            package = root / "codex_token_bola"
+            scripts = root / "scripts"
+            package.mkdir()
+            scripts.mkdir()
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (scripts / "__init__.py").write_text("", encoding="utf-8")
+            for facade, runtime in (("cli", "bola"), ("hook", "hook")):
+                (package / f"{facade}.py").write_text(
+                    (ROOT / "codex_token_bola" / f"{facade}.py").read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+                (scripts / f"{runtime}.py").write_text(
+                    f"def main():\n    return {facade!r}\n",
+                    encoding="utf-8",
+                )
+
+            for facade in ("cli", "hook"):
+                with self.subTest(facade=facade):
+                    result = subprocess.run(
+                        [sys.executable, "-c", f"from codex_token_bola.{facade} import main; print(main())"],
+                        cwd=root,
+                        env=self.fake_package_env(root),
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(result.stdout, f"{facade}\n")
+
+    def test_source_facades_preserve_bundled_runtime_dependency_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            package = root / "codex_token_bola"
+            runtime_package = package / "_runtime"
+            runtime_package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (runtime_package / "__init__.py").write_text("", encoding="utf-8")
+            for facade, runtime in (("cli", "bola"), ("hook", "hook")):
+                (package / f"{facade}.py").write_text(
+                    (ROOT / "codex_token_bola" / f"{facade}.py").read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+                (runtime_package / f"{runtime}.py").write_text(
+                    "import bola_missing_runtime_dependency\n",
+                    encoding="utf-8",
+                )
+
+            for facade in ("cli", "hook"):
+                with self.subTest(facade=facade):
+                    result = subprocess.run(
+                        [sys.executable, "-c", f"import codex_token_bola.{facade}"],
+                        cwd=root,
+                        env=self.fake_package_env(root),
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("bola_missing_runtime_dependency", result.stderr)
+                    self.assertNotIn("No module named 'scripts'", result.stderr)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -102,6 +103,35 @@ class DashboardOperationManagerTests(unittest.TestCase):
         with self.assertRaises(operation_state.ServerShuttingDown):
             manager.begin("cleanup", "/tmp/output")
         lease.close()
+
+    def test_shutdown_waits_for_operation_handler_lease(self) -> None:
+        serve = load_module("serve_dashboard_shutdown_lease_test", SCRIPTS / "serve_dashboard.py")
+        manager = serve.dashboard_operation_state.DashboardOperationManager()
+        lease = manager.begin("analysis", "/tmp/output")
+
+        class FinishedProcess:
+            def request_shutdown(self) -> None:
+                return None
+
+            def wait(self, timeout=None) -> int:
+                return 0
+
+        manager.attach_process(lease.operation_id, FinishedProcess())
+        finished = threading.Event()
+
+        def shutdown() -> None:
+            serve.shutdown_dashboard_operations(manager)
+            finished.set()
+
+        thread = threading.Thread(target=shutdown)
+        thread.start()
+        try:
+            self.assertFalse(finished.wait(0.1))
+            lease.close()
+            self.assertTrue(finished.wait(1.0))
+        finally:
+            lease.close()
+            thread.join(timeout=1.0)
 
     def test_service_status_reports_idle_without_exposing_lock_details(self) -> None:
         serve = load_module("serve_dashboard_service_status_idle_test", SCRIPTS / "serve_dashboard.py")
@@ -284,6 +314,33 @@ class DashboardServerRuntimeTests(unittest.TestCase):
             finally:
                 destination.close()
                 runtime.close()
+
+    def test_dynamic_operation_start_hands_off_paths_before_claiming_each_operation(self) -> None:
+        for kind in ("analysis", "cleanup", "cost_recalculation"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                first_paths = self.paths(root, "a")
+                second_paths = self.paths(root, "b")
+                operations = operation_state.DashboardOperationManager()
+                runtime = server_runtime.DashboardRuntimeManager(first_paths, dynamic=True, operation_manager=operations)
+                try:
+                    with (
+                        mock.patch.object(server_runtime.service_paths, "acquire_path_lock", return_value=contextlib.nullcontext()),
+                        mock.patch.object(server_runtime.service_paths, "resolve_runtime_paths", return_value=second_paths),
+                    ):
+                        lease, paths = runtime.begin_operation(kind)
+
+                    active = operations.active_record()
+                    self.assertEqual(paths, second_paths)
+                    self.assertIsNotNone(active)
+                    self.assertEqual(active.output_dir, second_paths.output_dir)
+                    with self.assertRaises(server_runtime.DashboardServerBusy):
+                        server_runtime.DashboardServerLease.acquire(second_paths.output_dir, "destination-conflict")
+                    source_replacement = server_runtime.DashboardServerLease.acquire(first_paths.output_dir, "source-replacement")
+                    source_replacement.close()
+                    lease.close()
+                finally:
+                    runtime.close()
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "parent-death supervision requires Linux")

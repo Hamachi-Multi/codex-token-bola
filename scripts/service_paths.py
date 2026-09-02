@@ -8,10 +8,11 @@ import json
 import os
 import pathlib
 import sys
-import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterator, Mapping
+
+import atomic_io
 
 try:
     from platformdirs import user_config_path, user_data_path
@@ -419,25 +420,14 @@ def write_path_transition(payload: PathTransition | Mapping[str, object], path: 
     value = transition.to_payload()
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     target.parent.chmod(0o700)
-    temporary = target.with_name(f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, target)
-        target.chmod(0o600)
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
+    text = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+    atomic_io.write_text_owner_only(target, text)
     return target
 
 
 def clear_path_transition(path: str | pathlib.Path | None = None) -> None:
     target = _expanded_absolute(path) if path is not None else path_transition_path()
-    target.unlink(missing_ok=True)
+    atomic_io.unlink_durable(target)
 
 
 def _parse_runtime_config(text: str, target: pathlib.Path) -> dict[str, object]:
@@ -520,18 +510,8 @@ def write_config(config: Mapping[str, object], path: str | pathlib.Path | None =
         payload[key] = str(_expanded_absolute(str(value)))
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     target.parent.chmod(0o700)
-    temporary = target.with_name(f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write("\n".join(f"{key}={value}" for key, value in payload.items()) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, target)
-        target.chmod(0o600)
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
+    text = "\n".join(f"{key}={value}" for key, value in payload.items()) + "\n"
+    atomic_io.write_text_owner_only(target, text)
     return target
 
 

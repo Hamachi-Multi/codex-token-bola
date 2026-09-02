@@ -13,7 +13,7 @@ import {
   turnStatusClass,
 } from './formatters.js';
 
-export function createSelectedTurnController({ params, refreshScrollFades, dialogManager }) {
+export function createSelectedTurnController({ detailRoutes, refreshScrollFades, dialogManager }) {
   let modalDetailData = null;
   let modalToolSummaryExpanded = false;
   const turnDialog = dialogManager.register({
@@ -348,10 +348,7 @@ async function openTurnModalFromToolLink(button) {
   document.getElementById('turn-modal-body').innerHTML = selectedTurnLoadingPanel();
   openTurnModal(button);
   try {
-    const q = params();
-    q.set('session_id', session);
-    q.set('turn_id', turn);
-    const detail = await getCachedJSON('/api/turn?' + q);
+    const detail = await getCachedJSON(detailRoutes.turn(session, turn));
     if (seq !== state.modalSeq) return;
     modalDetailData = detail;
     document.getElementById('turn-modal-body').innerHTML = renderTurnModal(detail);

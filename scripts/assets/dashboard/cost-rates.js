@@ -1,4 +1,5 @@
 import { getJSON, isServiceBusyError, postJSON } from './api.js';
+import { operationRunningLabel } from './service-operations.js';
 import { esc } from './ui.js';
 
 const TODAY_UTC = () => new Date().toISOString().slice(0, 10);
@@ -356,10 +357,7 @@ export function createCostRatesController({ refreshAnalytics, dialogManager, onM
       if (error.code === 'cost_rates_revision_conflict') {
         setStatus('Cost rates changed elsewhere. Reload and try again', 'error');
       } else if (isServiceBusyError(error)) {
-        const operation = error.operation === 'cleanup'
-          ? 'Cleanup'
-          : (error.operation === 'cost_recalculation' ? 'Cost recalculation' : 'Analyze');
-        setStatus(`${operation} is running. Try again when it finishes`, 'error');
+        setStatus(`${operationRunningLabel(error.operation)}. Try again when it finishes`, 'error');
         serviceActivityRefresh();
       } else {
         setStatus(error.message || 'Cost rate update failed', 'error');
@@ -400,10 +398,7 @@ export function createCostRatesController({ refreshAnalytics, dialogManager, onM
       if (error.code === 'cost_rates_revision_conflict') {
         setStatus('Cost rates changed elsewhere. Reload and try again', 'error');
       } else if (isServiceBusyError(error)) {
-        const operation = error.operation === 'cleanup'
-          ? 'Cleanup'
-          : (error.operation === 'cost_recalculation' ? 'Cost recalculation' : 'Analyze');
-        setStatus(`${operation} is running. Try again when it finishes`, 'error');
+        setStatus(`${operationRunningLabel(error.operation)}. Try again when it finishes`, 'error');
         serviceActivityRefresh();
       } else {
         setStatus(error.message || 'Cost rate reset failed', 'error');
@@ -438,10 +433,7 @@ export function createCostRatesController({ refreshAnalytics, dialogManager, onM
       setStatus(`Cost Units recalculated for ${Number(result.recalculated_turns || 0).toLocaleString()} turns`, 'success');
     } catch (error) {
       if (isServiceBusyError(error)) {
-        const operation = error.operation === 'cleanup'
-          ? 'Cleanup'
-          : (error.operation === 'cost_recalculation' ? 'Cost recalculation' : 'Analyze');
-        setStatus(`${operation} is running. Try again when it finishes`, 'error');
+        setStatus(`${operationRunningLabel(error.operation)}. Try again when it finishes`, 'error');
       } else {
         setStatus(error.message || 'Cost Units recalculation failed', 'error');
       }

@@ -129,22 +129,6 @@ def completed_turn_from_row(row: dict[str, Any]) -> tuple[str, str] | None:
     return None
 
 
-def record_unavailable_event(row: dict[str, Any]) -> None:
-    event, evidence_path, captured_at_ns = turn_resolution.write_unavailable_evidence(BASE_DIR, row)
-    row["token_resolution_event_id"] = event
-    QUARANTINE_RESULTS.append(
-        quarantine_health.record_event(
-            BASE_DIR,
-            event=event,
-            kind=turn_resolution.UNAVAILABLE_KIND,
-            source=str(row.get("transcript_path") or "unknown"),
-            error=str(row.get("token_resolution_reason") or "unknown"),
-            evidence_path=evidence_path,
-            captured_at_ns=captured_at_ns,
-        )
-    )
-
-
 def completed_turn_exists_in_current_segments(session_id: str, turn_id: str) -> bool:
     try:
         current_sources = raw_segments.current_segment_paths(BASE_DIR, kind="prompt_usage")
@@ -187,6 +171,10 @@ def reconcile_one(path: pathlib.Path, completed_turns: set[tuple[str, str]]) -> 
         move_bad_state(path, repr(exc))
         return "bad"
 
+    if not isinstance(state, dict):
+        move_bad_state(path, f"state must be a JSON object, got {type(state).__name__}")
+        return "bad"
+
     record_type = state.get("record_type")
     if record_type == "turn_stop_missing_start":
         return reconcile_missing_start_stop(path, state, completed_turns)
@@ -220,11 +208,26 @@ def reconcile_one(path: pathlib.Path, completed_turns: set[tuple[str, str]]) -> 
         if full_turn_end is not None:
             end_snapshot, turn_end = full_snapshot, full_turn_end
 
-    start_usage = turn_capture.normalize_usage(state.get("start_token_usage"))
-    end_usage = turn_capture.normalize_usage(end_snapshot.get("total_token_usage")) if end_snapshot.get("found") else start_usage
+    if end_snapshot.get("found"):
+        resolved_usage = turn_capture.resolved_turn_usage(state, end_snapshot)
+        start_usage = resolved_usage.start_usage
+        end_usage = resolved_usage.end_usage
+        usage = resolved_usage.usage
+        estimated = resolved_usage.estimated
+        token_source = (
+            "transcript_path token_count.info.last_token_usage aggregate after start offset"
+            if resolved_usage.start_usage_source == "unavailable"
+            else "reconcile: transcript token_count diff bounded by turn end event"
+        )
+    else:
+        start_usage = turn_capture.normalize_usage(state.get("start_token_usage"))
+        end_usage = start_usage
+        usage = turn_capture.usage_delta(start_usage, end_usage)
+        estimated = True
+        token_source = "reconcile: transcript token_count diff bounded by turn end event"
     turn_type = turn_end.get("type")
-    status = "aborted" if turn_type in {"task_aborted", "turn_aborted"} else "completed"
-    lifecycle_reason = turn_end.get("reason") if status == "aborted" else None
+    status = str(turn_lifecycle.terminal_status(turn_end) or "completed")
+    lifecycle_reason = turn_lifecycle.terminal_reason(turn_end)
     resolution_status = turn_resolution.RESOLVED if end_snapshot.get("found") else turn_resolution.UNAVAILABLE
     resolution_reason = None if resolution_status == turn_resolution.RESOLVED else str(end_snapshot.get("reason") or f"no_token_count_before_{turn_type}")
     record = {
@@ -242,8 +245,8 @@ def reconcile_one(path: pathlib.Path, completed_turns: set[tuple[str, str]]) -> 
         "token_resolution_status": resolution_status,
         "token_resolution_reason": resolution_reason,
         "started_at": state.get("captured_at"),
-        "stopped_at": None,
-        "usage": turn_capture.usage_delta(start_usage, end_usage),
+        "stopped_at": turn_lifecycle.terminal_stopped_at(turn_end),
+        "usage": usage,
         "start_token_usage": start_usage,
         "end_token_usage": end_usage,
         "start_token_snapshot": turn_capture.compact_snapshot(state.get("start_token_snapshot")),
@@ -255,21 +258,24 @@ def reconcile_one(path: pathlib.Path, completed_turns: set[tuple[str, str]]) -> 
         "assistant": turn_capture.assistant_metadata({}),
         "model_call_count": len(end_snapshot.get("model_calls") or []),
         "hook_input": state.get("hook_input"),
-        "token_source": "reconcile: transcript token_count diff bounded by turn end event",
+        "token_source": token_source,
         "sqlite_token_source_used": False,
-        "estimated": True,
+        "estimated": estimated,
         "start_state_found": True,
     }
     if completed_turn_exists_in_current_segments(session_id, turn_id):
         path.unlink(missing_ok=True)
         completed_turns.add((session_id, turn_id))
         return "duplicate"
-    if resolution_status == turn_resolution.UNAVAILABLE:
-        record_unavailable_event(record)
-    if turn_capture.append_prompt_usage(record, base_dir=BASE_DIR):
+    finalization = turn_capture.finalize_prompt_usage_result(record, state_path=path, base_dir=BASE_DIR)
+    if finalization.status in {"appended", "appended_state_cleanup_pending"}:
+        if resolution_status == turn_resolution.UNAVAILABLE:
+            QUARANTINE_RESULTS.append(quarantine_health.record_unavailable(BASE_DIR, record))
         completed_turns.add((session_id, turn_id))
-        path.unlink(missing_ok=True)
         return resolution_status if resolution_status == turn_resolution.UNAVAILABLE else status
+    if finalization.status == "duplicate":
+        completed_turns.add((session_id, turn_id))
+        return "duplicate"
     return "write_failed"
 
 
@@ -279,12 +285,22 @@ def reconcile_missing_start_stop(path: pathlib.Path, state: dict[str, Any], comp
     if not session_id or not turn_id:
         move_bad_state(path, "missing ids")
         return "bad"
-    if (session_id, turn_id) in completed_turns:
-        path.unlink(missing_ok=True)
-        return "duplicate"
     if not state.get("transcript_path"):
-        path.unlink(missing_ok=True)
-        return "excluded_missing_transcript_path"
+        if (session_id, turn_id) in completed_turns:
+            finalization = turn_capture.finalize_missing_start_terminal_result(
+                {"session_id": session_id, "turn_id": turn_id},
+                state_path=path,
+                base_dir=BASE_DIR,
+                terminal_exists=lambda: True,
+            )
+            return "duplicate" if finalization.status != "failed" else "write_failed"
+        finalization = turn_capture.finalize_missing_start_excluded_result(
+            state_path=path,
+            session_id=session_id,
+            turn_id=turn_id,
+            reason="excluded_missing_transcript_path",
+        )
+        return "excluded_missing_transcript_path" if finalization.status != "failed" else "write_failed"
 
     stream, error = transcript_parser.transcript_event_stream(state.get("transcript_path"))
     if error is not None:
@@ -301,9 +317,21 @@ def reconcile_missing_start_stop(path: pathlib.Path, state: dict[str, Any], comp
         fallback_stopped_at=turn_capture.utc_now(),
     )
     if not snapshot.get("found"):
+        if (session_id, turn_id) in completed_turns:
+            finalization = turn_capture.finalize_missing_start_terminal_result(
+                {"session_id": session_id, "turn_id": turn_id},
+                state_path=path,
+                base_dir=BASE_DIR,
+                terminal_exists=lambda: True,
+            )
+            return "duplicate" if finalization.status != "failed" else "write_failed"
         return "pending"
 
     status = str(snapshot.get("turn_status") or "completed")
+    model_call_count = turn_capture.safe_int(snapshot.get("usable_last_token_usage_count"))
+    resolution_status = turn_resolution.RESOLVED if model_call_count > 0 else turn_resolution.UNAVAILABLE
+    terminal_name = "task_aborted" if status == "aborted" else "task_complete"
+    resolution_reason = None if resolution_status == turn_resolution.RESOLVED else f"no_token_count_before_{terminal_name}"
     usage = turn_capture.usage_delta(turn_capture.zero_usage(), turn_capture.normalize_usage(snapshot.get("total_token_usage")))
     record = {
         "schema_version": 2,
@@ -317,6 +345,8 @@ def reconcile_missing_start_stop(path: pathlib.Path, state: dict[str, Any], comp
         "transcript_path": state.get("transcript_path"),
         "turn_status": status,
         "lifecycle_end_reason": f"goal_auto_{status}",
+        "token_resolution_status": resolution_status,
+        "token_resolution_reason": resolution_reason,
         "started_at": snapshot.get("turn_started_at"),
         "stopped_at": snapshot.get("turn_stopped_at") or state.get("stopped_at"),
         "usage": usage,
@@ -326,21 +356,35 @@ def reconcile_missing_start_stop(path: pathlib.Path, state: dict[str, Any], comp
         "end_token_snapshot": turn_capture.compact_snapshot(snapshot),
         "prompt": turn_capture.prompt_metadata("", preview_chars=0),
         "assistant": state.get("assistant") or turn_capture.assistant_metadata({}),
-        "model_call_count": len(snapshot.get("model_calls") or []),
+        "model_call_count": model_call_count,
         "hook_input": state.get("hook_input"),
         "token_source": snapshot.get("token_source"),
         "sqlite_token_source_used": False,
         "estimated": True,
         "start_state_found": False,
     }
-    if completed_turn_exists_in_current_segments(session_id, turn_id):
-        path.unlink(missing_ok=True)
+    unavailable_evidence: list[dict[str, Any]] = []
+
+    def record_unavailable_before_append() -> None:
+        if resolution_status == turn_resolution.UNAVAILABLE:
+            unavailable_evidence.append(quarantine_health.record_unavailable(BASE_DIR, record))
+
+    finalization = turn_capture.finalize_missing_start_terminal_result(
+        record,
+        state_path=path,
+        base_dir=BASE_DIR,
+        terminal_exists=lambda: (session_id, turn_id) in completed_turns
+        or completed_turn_exists_in_current_segments(session_id, turn_id),
+        before_terminal_append=record_unavailable_before_append,
+    )
+    if finalization.status in {"appended", "appended_state_cleanup_pending"}:
+        QUARANTINE_RESULTS.extend(unavailable_evidence)
+        completed_turns.add((session_id, turn_id))
+        return resolution_status if resolution_status == turn_resolution.UNAVAILABLE else status
+    if finalization.status == "duplicate":
+        QUARANTINE_RESULTS.extend(unavailable_evidence)
         completed_turns.add((session_id, turn_id))
         return "duplicate"
-    if turn_capture.append_prompt_usage(record, base_dir=BASE_DIR):
-        completed_turns.add((session_id, turn_id))
-        path.unlink(missing_ok=True)
-        return status
     return "write_failed"
 
 

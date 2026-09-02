@@ -49,6 +49,19 @@ except ModuleNotFoundError:
         unittest,
     )
 
+try:
+    from tests.retention_support import (
+        prepare_archived_retention_plan,
+        write_archived_segment,
+        write_segment_manifest,
+    )
+except ModuleNotFoundError:
+    from retention_support import (
+        prepare_archived_retention_plan,
+        write_archived_segment,
+        write_segment_manifest,
+    )
+
 
 class DashboardCleanupRetentionPruneTests(DashboardFixtureMixin, unittest.TestCase):
     RETENTION_CUTOFF = "2026-05-20T00:00:00+00:00"
@@ -121,6 +134,118 @@ class DashboardCleanupRetentionPruneTests(DashboardFixtureMixin, unittest.TestCa
 
         self.assertEqual(after, before)
         self.assertIsNone(job)
+
+    def test_retention_apply_preserves_service_marker_for_zero_row_result(self) -> None:
+        cleanup = load_module("cleanup_retention_zero_row_marker_test", ROOT / "scripts" / "dashboard_cleanup.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            cutoff = datetime(2026, 5, 20, tzinfo=timezone.utc).timestamp()
+            operation_job_id = "retention:zero-row-test"
+            cleanup.write_cleanup_retention_job(
+                base,
+                cleanup._retention.RetentionJob.create_at(
+                    cleanup._retention.RetentionPhase.DERIVED_RESET_COMPLETE,
+                    operation_job_id=operation_job_id,
+                    cutoff_unix=cutoff,
+                    deleted_rows=0,
+                    physical_delete_pending=False,
+                    derived_rebuild_required=True,
+                    recovery_required=True,
+                    pending_files=0,
+                ),
+            )
+            plan = {
+                "base": str(base),
+                "cutoff": cutoff,
+                "operation_job_id": operation_job_id,
+                "segments": {
+                    "deleted_rows": 0,
+                    "scanned_rows": 0,
+                    "deleted_bytes": 0,
+                    "previous_manifest": {"segments": []},
+                    "next_manifest": {"segments": []},
+                },
+                "untracked": [],
+                "pending_turn_state": {},
+                "pruned_turns": [],
+            }
+
+            with mock.patch.object(
+                cleanup._retention.raw_segments,
+                "apply_segment_plans",
+                return_value={
+                    "deleted_files": 0,
+                    "rewritten_files": 0,
+                    "physical_delete_pending": False,
+                    "pending_files": 0,
+                    "unlink_errors": [],
+                },
+            ):
+                result = cleanup.apply_delete_logs_older_than_plan_result(plan)
+            persisted = cleanup.read_cleanup_retention_job_model(base)
+
+        self.assertEqual(result.summary["deleted_rows"], 0)
+        self.assertEqual(result.marker_state, "persisted")
+        self.assertEqual(result.job.phase, cleanup._retention.RetentionPhase.DERIVED_REBUILD_REQUIRED)
+        self.assertEqual(persisted.phase, cleanup._retention.RetentionPhase.DERIVED_REBUILD_REQUIRED)
+
+    def test_retention_service_rejects_missing_or_mismatched_apply_marker(self) -> None:
+        service = load_module("retention_apply_contract_validation_test", ROOT / "scripts" / "bola.py").retention_service
+        operation_job_id = "retention:contract-test"
+        expected = service.RetentionJob.create_at(
+            service.RetentionPhase.DERIVED_REBUILD_REQUIRED,
+            operation_job_id=operation_job_id,
+            cutoff_unix=1.0,
+            deleted_rows=1,
+            physical_delete_pending=False,
+            derived_rebuild_required=True,
+            recovery_required=True,
+            pending_files=0,
+        )
+        good_result = service.dashboard_cleanup.RetentionApplyResult(
+            summary={"deleted_rows": 1, "physical_delete_pending": False},
+            marker_state="persisted",
+            job=expected,
+        )
+
+        self.assertEqual(
+            service.validated_apply_job(
+                good_result,
+                expected,
+                operation_job_id=operation_job_id,
+                physical_delete_pending=False,
+            ),
+            expected,
+        )
+        invalid_results = [
+            (service.dashboard_cleanup.RetentionApplyResult({}, "cleared", None), None),
+            (
+                good_result,
+                expected.updated(operation_job_id="retention:different"),
+            ),
+            (
+                good_result,
+                service.RetentionJob.create_at(
+                    service.RetentionPhase.PHYSICAL_DELETE_PENDING,
+                    operation_job_id=operation_job_id,
+                    cutoff_unix=1.0,
+                    deleted_rows=1,
+                    physical_delete_pending=True,
+                    derived_rebuild_required=True,
+                    recovery_required=True,
+                    pending_files=1,
+                ),
+            ),
+        ]
+        for apply_result, persisted in invalid_results:
+            with self.subTest(apply_result=apply_result, persisted=persisted):
+                with self.assertRaises(service.RetentionJobValidationError):
+                    service.validated_apply_job(
+                        apply_result,
+                        persisted,
+                        operation_job_id=operation_job_id,
+                        physical_delete_pending=False,
+                    )
 
     def test_pending_turn_state_plan_preserves_state_after_drift(self) -> None:
         cleanup = load_module("cleanup_pending_turn_state_drift_test", ROOT / "scripts" / "dashboard_cleanup.py")
@@ -827,6 +952,37 @@ print(after - before)
             self.assertTrue(job["physical_delete_pending"])
             self.assertEqual(job["phase"], "physical_delete_pending")
 
+    def test_successful_sweep_clears_failed_physical_delete_before_rebuild_completion(self) -> None:
+        cleanup = load_module("cleanup_failed_physical_sweep_test", ROOT / "scripts" / "dashboard_cleanup.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp) / "token-usage"
+            cleanup.write_cleanup_retention_job(
+                base,
+                {
+                    "phase": "failed",
+                    "operation_job_id": "retention:failed-unlink",
+                    "cutoff_unix": 1.0,
+                    "deleted_rows": 1,
+                    "failed_stage": "physical_delete",
+                    "derived_rebuild_required": True,
+                    "recovery_required": True,
+                    "physical_delete_pending": True,
+                    "pending_files": 1,
+                    "unlink_errors": [{"path": "/old/raw", "error": "busy"}],
+                },
+            )
+
+            recovery = cleanup._recovery.recover_retention_cleanup(base)
+            rebuild = cleanup.complete_retention_derived_rebuild(base)
+
+        self.assertEqual(recovery["job"]["phase"], "derived_rebuild_required")
+        self.assertFalse(recovery["job"]["physical_delete_pending"])
+        self.assertEqual(recovery["job"]["pending_files"], 0)
+        self.assertNotIn("failed_stage", recovery["job"])
+        self.assertNotIn("unlink_errors", recovery["job"])
+        self.assertTrue(rebuild["updated"])
+        self.assertIsNone(rebuild["job"])
+
     def test_retention_prune_restores_current_files_when_reset_fails_after_empty_rotation(self) -> None:
         cli = load_module("cli_retention_reset_current_files_test", ROOT / "scripts" / "bola.py")
         raw_segments = cli.raw_segments
@@ -1143,14 +1299,16 @@ print(after - before)
         raw_segments = load_module("raw_segments_whole_prune_test", ROOT / "scripts" / "raw_segments.py")
         with tempfile.TemporaryDirectory() as tmp:
             base = pathlib.Path(tmp)
-            archive = base / "raw" / "archive"
-            archive.mkdir(parents=True)
-            old_segment = archive / "prompt-usage.raw.jsonl.20260501000000.20260501000000.1.jsonl.gz"
             payload = (json.dumps(_turn_raw("s1", "old", total=100) | {"captured_at": "2026-05-01T00:00:00+00:00"}) + "\n").encode("utf-8")
-            with gzip.open(old_segment, "wb") as handle:
-                handle.write(payload)
-            segment = _raw_segment(old_segment, payload=payload, min_time=1777593600.0, max_time=1777593600.0, rows=1)
-            raw_segments.write_manifest(base, raw_segments.empty_manifest(base) | {"segments": [segment]})
+            old_segment, segment = write_archived_segment(
+                raw_segments,
+                base,
+                payload=payload,
+                min_time=1777593600.0,
+                max_time=1777593600.0,
+                rows=1,
+            )
+            write_segment_manifest(raw_segments, base, [segment])
 
             result = cleanup.delete_logs_older_than(base, datetime(2026, 5, 20, tzinfo=timezone.utc).timestamp())
             old_exists = old_segment.exists()
@@ -1270,14 +1428,16 @@ print(after - before)
         raw_segments = cleanup._retention.raw_segments
         with tempfile.TemporaryDirectory() as tmp:
             base = pathlib.Path(tmp)
-            archive = base / "raw" / "archive"
-            archive.mkdir(parents=True)
-            old_segment = archive / "prompt-usage.raw.jsonl.20260501000000.20260501000000.1.jsonl.gz"
             payload = (json.dumps(_turn_raw("segment", "old", total=100) | {"captured_at": "2026-05-01T00:00:00+00:00"}) + "\n").encode("utf-8")
-            with gzip.open(old_segment, "wb") as handle:
-                handle.write(payload)
-            segment = _raw_segment(old_segment, payload=payload, min_time=1777593600.0, max_time=1777593600.0, rows=1)
-            raw_segments.write_manifest(base, raw_segments.empty_manifest(base) | {"segments": [segment]})
+            old_segment, segment = write_archived_segment(
+                raw_segments,
+                base,
+                payload=payload,
+                min_time=1777593600.0,
+                max_time=1777593600.0,
+                rows=1,
+            )
+            write_segment_manifest(raw_segments, base, [segment])
             plan = cleanup.plan_delete_logs_older_than(base, datetime(2026, 5, 20, tzinfo=timezone.utc).timestamp())
 
             with mock.patch.object(
@@ -1383,14 +1543,16 @@ print(after - before)
         cleanup = load_module("cleanup_manifest_failure_attribution_test", ROOT / "scripts" / "dashboard_cleanup.py")
         with tempfile.TemporaryDirectory() as tmp:
             base = pathlib.Path(tmp)
-            archive = base / "raw" / "archive"
-            archive.mkdir(parents=True)
-            old_segment = archive / "prompt-usage.raw.jsonl.20260501000000.20260501000000.1.jsonl.gz"
             payload = (json.dumps(_turn_raw("session", "old", total=100) | {"captured_at": "2026-05-01T00:00:00+00:00"}) + "\n").encode("utf-8")
-            with gzip.open(old_segment, "wb") as handle:
-                handle.write(payload)
-            segment = _raw_segment(old_segment, payload=payload, min_time=1777593600.0, max_time=1777593600.0, rows=1)
-            cleanup._retention.raw_segments.write_manifest(base, cleanup._retention.raw_segments.empty_manifest(base) | {"segments": [segment]})
+            _old_segment, segment = write_archived_segment(
+                cleanup._retention.raw_segments,
+                base,
+                payload=payload,
+                min_time=1777593600.0,
+                max_time=1777593600.0,
+                rows=1,
+            )
+            write_segment_manifest(cleanup._retention.raw_segments, base, [segment])
             plan = cleanup.plan_delete_logs_older_than(base, datetime(2026, 5, 20, tzinfo=timezone.utc).timestamp())
 
             with mock.patch.object(cleanup._retention.raw_segments._retention, "write_manifest", side_effect=OSError("manifest write failed")):
@@ -1416,14 +1578,16 @@ print(after - before)
         cleanup = load_module("cleanup_post_sweep_attribution_test", ROOT / "scripts" / "dashboard_cleanup.py")
         with tempfile.TemporaryDirectory() as tmp:
             base = pathlib.Path(tmp)
-            archive = base / "raw" / "archive"
-            archive.mkdir(parents=True)
-            old_segment = archive / "prompt-usage.raw.jsonl.20260501000000.20260501000000.1.jsonl.gz"
             payload = (json.dumps(_turn_raw("session", "old", total=100) | {"captured_at": "2026-05-01T00:00:00+00:00"}) + "\n").encode("utf-8")
-            with gzip.open(old_segment, "wb") as handle:
-                handle.write(payload)
-            segment = _raw_segment(old_segment, payload=payload, min_time=1777593600.0, max_time=1777593600.0, rows=1)
-            cleanup._retention.raw_segments.write_manifest(base, cleanup._retention.raw_segments.empty_manifest(base) | {"segments": [segment]})
+            _old_segment, segment = write_archived_segment(
+                cleanup._retention.raw_segments,
+                base,
+                payload=payload,
+                min_time=1777593600.0,
+                max_time=1777593600.0,
+                rows=1,
+            )
+            write_segment_manifest(cleanup._retention.raw_segments, base, [segment])
             plan = cleanup.plan_delete_logs_older_than(base, datetime(2026, 5, 20, tzinfo=timezone.utc).timestamp())
             real_sweep = cleanup._retention.raw_segments._retention.sweep_apply_marker
 
@@ -1450,18 +1614,149 @@ print(after - before)
         self.assertTrue(recovery["job"]["pruned_state_commit_recovered"])
         self.assertEqual(recovered, [("committed",)])
 
+    def test_retention_recovery_commits_attribution_after_process_interruption(self) -> None:
+        cleanup = load_module("cleanup_interrupted_attribution_commit_test", ROOT / "scripts" / "dashboard_cleanup.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            plan, _segment = prepare_archived_retention_plan(cleanup, base)
+
+            with mock.patch.object(cleanup._retention, "commit_pruned_turn_state", side_effect=KeyboardInterrupt()):
+                with self.assertRaises(KeyboardInterrupt):
+                    cleanup.apply_delete_logs_older_than_plan(plan)
+
+            interrupted = cleanup.read_cleanup_retention_job(base)
+            recovery = cleanup._recovery.recover_retention_cleanup(base)
+            with sqlite3.connect(base / "state" / "retention-pruned-turns.sqlite") as con:
+                recovered = con.execute("select state from pruned_turns").fetchall()
+            rebuild = cleanup.complete_retention_derived_rebuild(base)
+
+        self.assertEqual(interrupted["phase"], "planned")
+        self.assertEqual(len(interrupted["raw_segments_before_sha256"]), 64)
+        self.assertEqual(len(interrupted["raw_segments_after_sha256"]), 64)
+        self.assertEqual(recovery["job"]["phase"], "logical_delete_committed")
+        self.assertEqual(recovered, [("committed",)])
+        self.assertTrue(rebuild["updated"])
+        self.assertIsNone(rebuild["job"])
+
+    def test_retention_recovery_discards_attribution_when_raw_apply_never_started(self) -> None:
+        cleanup = load_module("cleanup_interrupted_attribution_discard_test", ROOT / "scripts" / "dashboard_cleanup.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            plan, _segment = prepare_archived_retention_plan(cleanup, base)
+
+            with mock.patch.object(cleanup._retention.raw_segments, "apply_segment_plans", side_effect=KeyboardInterrupt()):
+                with self.assertRaises(KeyboardInterrupt):
+                    cleanup.apply_delete_logs_older_than_plan(plan)
+
+            recovery = cleanup._recovery.recover_retention_cleanup(base)
+            with sqlite3.connect(base / "state" / "retention-pruned-turns.sqlite") as con:
+                pending_rows = con.execute("select count(*) from pruned_turns where state='pending'").fetchone()[0]
+            rebuild = cleanup.complete_retention_derived_rebuild(base)
+
+        self.assertEqual(recovery["job"]["phase"], "failed")
+        self.assertEqual(recovery["job"]["failed_stage"], "apply_recovery")
+        self.assertEqual(pending_rows, 0)
+        self.assertTrue(rebuild["updated"])
+        self.assertIsNone(rebuild["job"])
+
+    def test_retention_recovery_commits_attribution_before_pending_unlink_recovery(self) -> None:
+        cleanup = load_module("cleanup_interrupted_pending_unlink_test", ROOT / "scripts" / "dashboard_cleanup.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            plan, segment = prepare_archived_retention_plan(cleanup, base)
+            pending_sweep = {
+                "deleted_files": 0,
+                "pending_source_segments": [segment],
+                "errors": [{"path": segment["path"], "error": "busy"}],
+            }
+            with (
+                mock.patch.object(cleanup._retention.raw_segments._state, "sweep_segment_sources", return_value=pending_sweep),
+                mock.patch.object(cleanup._retention, "commit_pruned_turn_state", side_effect=KeyboardInterrupt()),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    cleanup.apply_delete_logs_older_than_plan(plan)
+                recovery = cleanup._recovery.recover_retention_cleanup(base)
+            with sqlite3.connect(base / "state" / "retention-pruned-turns.sqlite") as con:
+                recovered = con.execute("select state from pruned_turns").fetchall()
+
+        self.assertEqual(recovery["job"]["phase"], "physical_delete_pending")
+        self.assertTrue(recovery["job"]["physical_delete_pending"])
+        self.assertEqual(recovery["job"]["pending_files"], 1)
+        self.assertEqual(recovered, [("committed",)])
+
+    def test_retention_recovery_preserves_attribution_when_manifest_identity_is_unknown(self) -> None:
+        cleanup = load_module("cleanup_interrupted_attribution_unknown_test", ROOT / "scripts" / "dashboard_cleanup.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            plan, segment = prepare_archived_retention_plan(cleanup, base)
+
+            with mock.patch.object(cleanup._retention, "commit_pruned_turn_state", side_effect=KeyboardInterrupt()):
+                with self.assertRaises(KeyboardInterrupt):
+                    cleanup.apply_delete_logs_older_than_plan(plan)
+            drift = cleanup._retention.raw_segments.empty_manifest(base) | {
+                "segments": [segment, dict(segment, id="unexpected")]
+            }
+            cleanup._retention.raw_segments.write_manifest(base, drift)
+
+            with self.assertRaisesRegex(
+                cleanup._retention.raw_segments.ManifestError,
+                "cannot classify interrupted retention attribution",
+            ):
+                cleanup._recovery.recover_retention_cleanup(base)
+            preserved = cleanup.read_cleanup_retention_job(base)
+            with sqlite3.connect(base / "state" / "retention-pruned-turns.sqlite") as con:
+                pending = con.execute("select state from pruned_turns").fetchall()
+
+        self.assertEqual(preserved["phase"], "planned")
+        self.assertEqual(pending, [("pending",)])
+
+    def test_retention_recovery_preserves_legacy_stage_without_manifest_identity(self) -> None:
+        cleanup = load_module("cleanup_attribution_missing_identity_test", ROOT / "scripts" / "dashboard_cleanup.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            job_id = cleanup._recovery.stage_pruned_turn_state(
+                base,
+                1.0,
+                [{"session_id": "session", "turn_id": "turn", "captured_at_unix": 1.0}],
+                job_id="retention:missing-identity",
+            )
+            cleanup.write_cleanup_retention_job(
+                base,
+                {
+                    "phase": "planned",
+                    "operation_job_id": "retention:missing-identity",
+                    "pruned_state_job_id": job_id,
+                    "cutoff_unix": 1.0,
+                    "deleted_rows": 1,
+                    "derived_rebuild_required": True,
+                    "recovery_required": True,
+                    "physical_delete_pending": False,
+                },
+            )
+
+            with self.assertRaisesRegex(
+                cleanup._retention.raw_segments.ManifestError,
+                "without raw manifest identities",
+            ):
+                cleanup._recovery.recover_retention_cleanup(base)
+            preserved = cleanup.read_cleanup_retention_job(base)
+
+        self.assertEqual(preserved["pruned_state_job_id"], job_id)
+
     def test_retention_prune_preserves_unresolved_attribution_on_manifest_drift(self) -> None:
         cleanup = load_module("cleanup_manifest_drift_attribution_test", ROOT / "scripts" / "dashboard_cleanup.py")
         with tempfile.TemporaryDirectory() as tmp:
             base = pathlib.Path(tmp)
-            archive = base / "raw" / "archive"
-            archive.mkdir(parents=True)
-            old_segment = archive / "prompt-usage.raw.jsonl.20260501000000.20260501000000.1.jsonl.gz"
             payload = (json.dumps(_turn_raw("session", "old", total=100) | {"captured_at": "2026-05-01T00:00:00+00:00"}) + "\n").encode("utf-8")
-            with gzip.open(old_segment, "wb") as handle:
-                handle.write(payload)
-            segment = _raw_segment(old_segment, payload=payload, min_time=1777593600.0, max_time=1777593600.0, rows=1)
-            cleanup._retention.raw_segments.write_manifest(base, cleanup._retention.raw_segments.empty_manifest(base) | {"segments": [segment]})
+            _old_segment, segment = write_archived_segment(
+                cleanup._retention.raw_segments,
+                base,
+                payload=payload,
+                min_time=1777593600.0,
+                max_time=1777593600.0,
+                rows=1,
+            )
+            write_segment_manifest(cleanup._retention.raw_segments, base, [segment])
             plan = cleanup.plan_delete_logs_older_than(base, datetime(2026, 5, 20, tzinfo=timezone.utc).timestamp())
 
             def drift_then_fail(base_arg: pathlib.Path, _plan: dict[str, Any]) -> dict[str, Any]:

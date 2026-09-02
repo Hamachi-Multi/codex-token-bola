@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import pathlib
-import sqlite3
 from datetime import datetime
 from typing import Any, TypedDict
+
+import analytics_metadata
 
 
 class CleanupImpact(TypedDict, total=False):
@@ -128,26 +129,7 @@ def impact_payload(
 
 
 def read_run_metadata(db_path: pathlib.Path) -> dict[str, Any]:
-    if not db_path.exists():
-        return {}
-    try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return {}
-    try:
-        try:
-            rows = con.execute("select key, value from run_metadata").fetchall()
-        except sqlite3.Error:
-            return {}
-        metadata: dict[str, Any] = {}
-        for key, value in rows:
-            try:
-                metadata[str(key)] = json.loads(value)
-            except (TypeError, json.JSONDecodeError):
-                metadata[str(key)] = value
-        return metadata
-    finally:
-        con.close()
+    return analytics_metadata.read_run_metadata(db_path)
 
 
 def parse_row_time(value: Any) -> float | None:

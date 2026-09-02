@@ -17,12 +17,13 @@ if str(SCRIPT_DIR) not in sys.path:
 import dashboard_cleanup
 import pipeline_service
 import progress_control
+import quarantine_health
 import raw_segments
 import retention_checkpoints
 import service_lock
 import service_paths
 from retention_models import RetentionJob, RetentionJobValidationError, RetentionPhase
-from runtime_command_runner import ProcessResult, RuntimeCommand
+from runtime_command_runner import ProcessResult, RuntimeCommand, required_json_contract_error
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,30 @@ class RetentionExecutionError(RuntimeError):
         super().__init__(str(cause))
 
 
+def validated_apply_job(
+    apply_result: dashboard_cleanup.RetentionApplyResult,
+    persisted_job: RetentionJob | None,
+    *,
+    operation_job_id: str,
+    physical_delete_pending: bool,
+) -> RetentionJob:
+    expected_phase = (
+        RetentionPhase.PHYSICAL_DELETE_PENDING
+        if physical_delete_pending
+        else RetentionPhase.DERIVED_REBUILD_REQUIRED
+    )
+    returned_job = apply_result.job
+    if apply_result.marker_state != "persisted" or returned_job is None or persisted_job is None:
+        raise RetentionJobValidationError("retention apply did not persist its final marker")
+    if returned_job.operation_job_id != operation_job_id or persisted_job.operation_job_id != operation_job_id:
+        raise RetentionJobValidationError("retention apply marker operation_job_id mismatch")
+    if returned_job.phase is not expected_phase or persisted_job.phase is not expected_phase:
+        raise RetentionJobValidationError("retention apply marker phase mismatch")
+    if returned_job.to_payload() != persisted_job.to_payload():
+        raise RetentionJobValidationError("retention apply result does not match the persisted marker")
+    return persisted_job
+
+
 def parse_cutoff(value: str) -> float:
     try:
         return float(value)
@@ -84,8 +109,7 @@ def run_retention_preview(options: RetentionPreviewOptions, resolve_paths: Calla
         )
     paths = resolve_paths(options.codex_dir, options.output_dir)
     try:
-        preview = dashboard_cleanup.retention_preview(paths.output_dir, cutoff, refresh_index=False)
-        signature = dashboard_cleanup.retention_preview_signature(paths.output_dir, cutoff)
+        preview = dashboard_cleanup.retention_preview_with_signature(paths.output_dir, cutoff, refresh_index=False)
     except raw_segments.ManifestError as exc:
         return RetentionResult(exit_code=2, payload={"error": "cleanup_preview_failed", "message": str(exc)})
     affected = [item for item in preview.get("files", []) if isinstance(item, dict) and item.get("affected")]
@@ -94,7 +118,7 @@ def run_retention_preview(options: RetentionPreviewOptions, resolve_paths: Calla
         exit_code=0,
         payload={
             "cutoff_unix": float(cutoff),
-            "preview_signature": signature,
+            "preview_signature": str(preview["preview_signature"]),
             "scanned_rows": int(preview.get("scanned_rows") or 0),
             "deletable_rows": int(preview.get("deletable_rows") or 0),
             "deletable_bytes": int(preview.get("deletable_bytes") or 0),
@@ -313,26 +337,39 @@ def run_retention_prune(options: RetentionPruneOptions, dependencies: RetentionD
                 processed=0,
                 total=max(1, planned_rows),
             )
-            delete_result = dashboard_cleanup.apply_delete_logs_older_than_plan(delete_plan)
-            persisted_job = dashboard_cleanup.read_cleanup_retention_job_model(base)
-            if persisted_job is not None and persisted_job.operation_job_id == operation_job_id:
-                operation_job = persisted_job
-            elif operation_job is not None and operation_job.phase is RetentionPhase.DERIVED_RESET_COMPLETE:
-                operation_job = operation_job.transition(
-                    RetentionPhase.PLANNED,
-                    deleted_rows=int(delete_result.get("deleted_rows") or 0),
-                    derived_rebuild_required=True,
-                    physical_delete_pending=False,
-                    pending_files=0,
+            apply_result = dashboard_cleanup.apply_delete_logs_older_than_plan_result(delete_plan)
+            delete_result = apply_result.summary
+            try:
+                operation_job = validated_apply_job(
+                    apply_result,
+                    dashboard_cleanup.read_cleanup_retention_job_model(base),
+                    operation_job_id=operation_job_id,
+                    physical_delete_pending=bool(delete_result.get("physical_delete_pending")),
                 )
-                if bool(delete_result.get("physical_delete_pending")):
-                    operation_job = operation_job.transition(
-                        RetentionPhase.PHYSICAL_DELETE_PENDING,
-                        physical_delete_pending=True,
-                        pending_files=int(delete_result.get("pending_files") or 0),
-                    )
-                else:
-                    operation_job = operation_job.transition(RetentionPhase.LOGICAL_DELETE_COMMITTED)
+            except RetentionJobValidationError as exc:
+                progress_control.write_progress(
+                    phase="cleanup-delete",
+                    phase_index=1,
+                    phase_count=4,
+                    status="failed",
+                    checkpoint="apply-contract",
+                    phase_progress=0.0,
+                )
+                return RetentionResult(
+                    exit_code=2,
+                    payload={
+                        "error": "retention_apply_contract_failed",
+                        "stage": "delete",
+                        "message": str(exc),
+                        "partial_mutation": True,
+                        "recovery_required": True,
+                        "derived_rebuild_required": True,
+                        "physical_delete_pending": bool(delete_result.get("physical_delete_pending")),
+                        "pending_files": int(delete_result.get("pending_files") or 0),
+                        "deleted_rows": int(delete_result.get("deleted_rows") or 0),
+                        "delete": delete_result,
+                    },
+                )
             progress_control.write_progress(
                 phase="cleanup-delete",
                 phase_index=1,
@@ -350,75 +387,75 @@ def run_retention_prune(options: RetentionPruneOptions, dependencies: RetentionD
                 pending_files=int(delete_result.get("pending_files") or 0),
                 delete=delete_result,
             )
+
+            normalize_result: dict[str, object] = {}
+            build_result: dict[str, object] = {}
+
+            def rebuild_failure(
+                stage: str,
+                result: ProcessResult,
+                *,
+                contract_error: dict[str, object] | None = None,
+            ) -> RetentionResult:
+                progress_control.write_progress(
+                    phase="cleanup-rebuild",
+                    phase_index=2,
+                    phase_count=4,
+                    status="failed",
+                    checkpoint=f"{stage}-contract" if contract_error is not None else f"{stage}-failed",
+                    phase_progress=0.1 if stage == "normalize" else 0.6,
+                )
+                write_operation_job(
+                    RetentionPhase.FAILED,
+                    failed_stage=stage,
+                    derived_rebuild_required=True,
+                    recovery_required=True,
+                    physical_delete_pending=bool(delete_result.get("physical_delete_pending")),
+                    pending_files=int(delete_result.get("pending_files") or 0),
+                    cutoff_unix=cutoff,
+                    deleted_rows=delete_result["deleted_rows"],
+                )
+                payload: dict[str, object] = {
+                    "error": "retention_rebuild_failed",
+                    "stage": stage,
+                    "partial_mutation": True,
+                    "recovery_required": True,
+                    "derived_rebuild_required": True,
+                    "physical_delete_pending": bool(delete_result.get("physical_delete_pending")),
+                    "pending_files": int(delete_result.get("pending_files") or 0),
+                    "deleted_rows": delete_result["deleted_rows"],
+                    "delete": delete_result,
+                    "reset": reset_result,
+                    "normalize": normalize_result,
+                }
+                if stage == "build":
+                    payload["build"] = build_result
+                if contract_error is not None:
+                    payload["child_output_contract"] = contract_error
+                return RetentionResult(
+                    exit_code=2 if contract_error is not None else result.exit_code,
+                    process_output=result,
+                    payload=payload,
+                )
+
             progress_control.write_progress(phase="cleanup-rebuild", phase_index=2, phase_count=4, checkpoint="normalize", phase_progress=0.0)
             normalize = dependencies.run_command(RuntimeCommand.NORMALIZE, [], child_env)
             normalize_result = normalize.payload or {}
             normalize_degraded = pipeline_service.completed_degraded(normalize)
             if normalize.exit_code != 0 and not normalize_degraded:
-                progress_control.write_progress(
-                    phase="cleanup-rebuild", phase_index=2, phase_count=4, status="failed", checkpoint="normalize-failed", phase_progress=0.1
-                )
-                write_operation_job(
-                    RetentionPhase.FAILED,
-                    failed_stage="normalize",
-                    derived_rebuild_required=True,
-                    physical_delete_pending=bool(delete_result.get("physical_delete_pending")),
-                    pending_files=int(delete_result.get("pending_files") or 0),
-                    cutoff_unix=cutoff,
-                    deleted_rows=delete_result["deleted_rows"],
-                )
-                return RetentionResult(
-                    exit_code=normalize.exit_code,
-                    process_output=normalize,
-                    payload={
-                        "error": "retention_rebuild_failed",
-                        "stage": "normalize",
-                        "partial_mutation": True,
-                        "recovery_required": True,
-                        "derived_rebuild_required": True,
-                        "physical_delete_pending": bool(delete_result.get("physical_delete_pending")),
-                        "pending_files": int(delete_result.get("pending_files") or 0),
-                        "deleted_rows": delete_result["deleted_rows"],
-                        "delete": delete_result,
-                        "reset": reset_result,
-                        "normalize": normalize_result,
-                    },
-                )
+                return rebuild_failure("normalize", normalize)
+            contract_error = required_json_contract_error(normalize, operation="normalize")
+            if contract_error is not None:
+                return rebuild_failure("normalize", normalize, contract_error=contract_error)
             degraded = degraded or normalize_degraded
             progress_control.write_progress(phase="cleanup-rebuild", phase_index=2, phase_count=4, checkpoint="build", phase_progress=0.45)
             build = dependencies.run_command(RuntimeCommand.BUILD, [], child_env)
             build_result = build.payload or {}
             if build.exit_code != 0:
-                progress_control.write_progress(
-                    phase="cleanup-rebuild", phase_index=2, phase_count=4, status="failed", checkpoint="build-failed", phase_progress=0.6
-                )
-                write_operation_job(
-                    RetentionPhase.FAILED,
-                    failed_stage="build",
-                    derived_rebuild_required=True,
-                    physical_delete_pending=bool(delete_result.get("physical_delete_pending")),
-                    pending_files=int(delete_result.get("pending_files") or 0),
-                    cutoff_unix=cutoff,
-                    deleted_rows=delete_result["deleted_rows"],
-                )
-                return RetentionResult(
-                    exit_code=build.exit_code,
-                    process_output=build,
-                    payload={
-                        "error": "retention_rebuild_failed",
-                        "stage": "build",
-                        "partial_mutation": True,
-                        "recovery_required": True,
-                        "derived_rebuild_required": True,
-                        "physical_delete_pending": bool(delete_result.get("physical_delete_pending")),
-                        "pending_files": int(delete_result.get("pending_files") or 0),
-                        "deleted_rows": delete_result["deleted_rows"],
-                        "delete": delete_result,
-                        "reset": reset_result,
-                        "normalize": normalize_result,
-                        "build": build_result,
-                    },
-                )
+                return rebuild_failure("build", build)
+            contract_error = required_json_contract_error(build, operation="build")
+            if contract_error is not None:
+                return rebuild_failure("build", build, contract_error=contract_error)
         except KeyboardInterrupt:
             progress_control.write_progress(
                 phase="cleanup-rebuild", phase_index=2, phase_count=4, status="failed", checkpoint="interrupted", phase_progress=0.0
@@ -454,7 +491,7 @@ def run_retention_prune(options: RetentionPruneOptions, dependencies: RetentionD
             exit_code=1 if degraded else 0,
             payload={
                 "status": "degraded" if degraded else "healthy",
-                "quarantine": pipeline_service.combined_quarantine(normalize_result),
+                "quarantine": quarantine_health.merge_operation_summaries(normalize_result),
                 "deleted_rows": delete_result["deleted_rows"],
                 "physical_delete_pending": bool(delete_result.get("physical_delete_pending")),
                 "pending_files": int(delete_result.get("pending_files") or 0),

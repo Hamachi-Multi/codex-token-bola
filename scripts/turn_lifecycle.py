@@ -59,10 +59,30 @@ def terminal_turn_event(event: dict[str, Any], turn_id: str | None = None) -> di
         "turn_id": event_turn_id,
         "reason": payload.get("reason"),
         "completed_at": payload.get("completed_at"),
+        "aborted_at": payload.get("aborted_at"),
         "duration_ms": payload.get("duration_ms"),
         "event_offset": int(event.get("line_start") or 0),
         "bounded_file_offset": int(event.get("next_offset") or 0),
     }
+
+
+def terminal_status(event: dict[str, Any] | None) -> str | None:
+    if not isinstance(event, dict) or event.get("type") not in TERMINAL_TURN_EVENT_TYPES:
+        return None
+    return "aborted" if event["type"] in {"task_aborted", "turn_aborted"} else "completed"
+
+
+def terminal_reason(event: dict[str, Any] | None) -> Any:
+    return event.get("reason") if terminal_status(event) == "aborted" else None
+
+
+def terminal_stopped_at(event: dict[str, Any] | None, fallback: Any = None) -> str | None:
+    if terminal_status(event) is None:
+        return unix_or_timestamp_to_iso(fallback)
+    return unix_or_timestamp_to_iso(
+        event.get("aborted_at") or event.get("completed_at"),
+        event.get("timestamp") or fallback,
+    )
 
 
 @dataclass
@@ -75,6 +95,7 @@ class TurnLifecycleAccumulator:
     terminal_stopped_at: str | None = None
     model_calls: list[dict[str, Any]] = field(default_factory=list)
     usages: list[dict[str, int]] = field(default_factory=list)
+    usable_last_token_usage_count: int = 0
     latest_total_usage: dict[str, int] | None = None
     latest_last_usage: dict[str, int] | None = None
     latest_timestamp: Any = None
@@ -97,6 +118,7 @@ class TurnLifecycleAccumulator:
             self.terminal_stopped_at = None
             self.model_calls.clear()
             self.usages.clear()
+            self.usable_last_token_usage_count = 0
             self.latest_total_usage = None
             self.latest_last_usage = None
             self.latest_timestamp = None
@@ -107,10 +129,7 @@ class TurnLifecycleAccumulator:
         terminal = terminal_turn_event(event, self.turn_id)
         if terminal is not None:
             self.terminal_event = terminal
-            self.terminal_stopped_at = unix_or_timestamp_to_iso(
-                payload.get("aborted_at") or payload.get("completed_at"),
-                item.get("timestamp"),
-            )
+            self.terminal_stopped_at = terminal_stopped_at(terminal)
             self.active = False
             return True
         if payload_type != "token_count":
@@ -118,7 +137,16 @@ class TurnLifecycleAccumulator:
         info = payload.get("info")
         if not isinstance(info, dict):
             return False
-        last_usage = turn_capture.normalize_usage(info.get("last_token_usage"))
+        raw_last_usage = info.get("last_token_usage")
+        last_usage = turn_capture.normalize_usage(raw_last_usage)
+        if isinstance(raw_last_usage, dict) and any(
+            key in raw_last_usage
+            and isinstance(raw_last_usage.get(key), int)
+            and not isinstance(raw_last_usage.get(key), bool)
+            and raw_last_usage.get(key) >= 0
+            for key in turn_capture.USAGE_KEYS
+        ):
+            self.usable_last_token_usage_count += 1
         self.usages.append(last_usage)
         self.model_calls.append(
             {
@@ -136,9 +164,7 @@ class TurnLifecycleAccumulator:
 
     @property
     def status(self) -> str | None:
-        if self.terminal_event is None:
-            return None
-        return "aborted" if self.terminal_event["type"] in {"task_aborted", "turn_aborted"} else "completed"
+        return terminal_status(self.terminal_event)
 
     @property
     def stopped_at(self) -> str | None:
@@ -173,6 +199,7 @@ def full_lifecycle_snapshot(
     common: dict[str, Any] = {
         "path": path,
         "event_count": len(accumulator.model_calls),
+        "usable_last_token_usage_count": accumulator.usable_last_token_usage_count,
         "parse_error_seen": parse_error_seen,
     }
     if include_model_calls:
@@ -222,6 +249,7 @@ def bounded_usage_snapshot(
         "path": path,
         "file_size": file_size,
         "event_count": len(accumulator.model_calls),
+        "usable_last_token_usage_count": accumulator.usable_last_token_usage_count,
         "model_calls": list(accumulator.model_calls),
         "parse_error_seen": parse_error_seen,
         "scan_start": scan_start,
@@ -242,16 +270,23 @@ def bounded_usage_snapshot(
             return {"found": bool(latest), "reason": "scan_limit_reached", **common, **latest}
         return {"found": False, "reason": "turn_end_not_found", **common}
     terminal = accumulator.terminal_event
+    terminal_fields = {
+        "turn_status": accumulator.status,
+        "turn_stopped_at": accumulator.stopped_at,
+        "lifecycle_end_reason": terminal_reason(terminal),
+    }
     if not latest:
         return {
             "found": False,
             "reason": f"no_token_count_before_{terminal['type']}",
             "turn_end_event": terminal,
+            **terminal_fields,
             **common,
         }
     return {
         **latest,
         "turn_end_event": terminal,
+        **terminal_fields,
         "bounded_at_event_type": terminal["type"],
         "bounded_at_timestamp": terminal["timestamp"],
         "bounded_at_file_offset": terminal["bounded_file_offset"],

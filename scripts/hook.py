@@ -467,10 +467,7 @@ def compact_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 def usage_from_model_calls(snapshot: dict[str, Any]) -> dict[str, Any]:
-    calls = snapshot.get("model_calls")
-    if not isinstance(calls, list):
-        return usage_delta(zero_usage(), zero_usage())
-    return usage_delta(zero_usage(), usage_sum([call.get("usage") for call in calls if isinstance(call, dict)]))
+    return turn_capture.usage_from_model_calls(snapshot)
 
 
 def base_record(data: dict[str, Any], session_id: str, turn_id: str, transcript_path: str | None) -> dict[str, Any]:
@@ -618,8 +615,10 @@ def stop_missing_start_marker_path(session_id: str, turn_id: str) -> pathlib.Pat
     return STATE_DIR / f"{safe_name('stop:' + session_id + ':' + turn_id)}.json"
 
 
-def write_stop_missing_start_marker(data: dict[str, Any], session_id: str, turn_id: str, transcript_path: str | None) -> None:
-    marker = {
+def build_stop_missing_start_marker(
+    data: dict[str, Any], session_id: str, turn_id: str, transcript_path: str | None
+) -> dict[str, Any]:
+    return {
         "schema_version": 2,
         "record_type": "turn_stop_missing_start",
         "captured_at": utc_now(),
@@ -632,21 +631,8 @@ def write_stop_missing_start_marker(data: dict[str, Any], session_id: str, turn_
         "stopped_at": utc_now(),
         "assistant": assistant_metadata(data),
         "hook_input": safe_hook_fields(data),
+        "pending_append_state": "required",
     }
-    try:
-        write_json_atomic(stop_missing_start_marker_path(session_id, turn_id), marker)
-    except OSError as exc:
-        safe_append_jsonl(
-            ERROR_LOG,
-            {
-                "captured_at": utc_now(),
-                "event": str(data.get("hook_event_name") or "Stop"),
-                "error": "stop_marker_write_failed",
-                "exception": repr(exc),
-                "session_id": session_id,
-                "turn_id": turn_id,
-            },
-        )
 
 
 def defer_stop_recovery(data: dict[str, Any], session_id: str, turn_id: str, reason: str, detail: dict[str, Any] | None = None) -> None:
@@ -691,10 +677,30 @@ def handle_stop(data: dict[str, Any]) -> None:
 
     if start is None:
         record = missing_start_record(data, session_id, turn_id, transcript_path)
-        append_result = append_prompt_usage(record, detailed=True)
-        if not append_result:
-            log_raw_append_failed(data, session_id, turn_id, record, append_result)
-            write_stop_missing_start_marker(data, session_id, turn_id, transcript_path)
+        pending_result = turn_capture.append_missing_start_pending_result(
+            state_path=stop_missing_start_marker_path(session_id, turn_id),
+            initial_state=build_stop_missing_start_marker(data, session_id, turn_id, transcript_path),
+            record=record,
+            base_dir=BASE_DIR,
+            lock_timeout_ms=HOOK_APPEND_LOCK_TIMEOUT_MS,
+        )
+        if pending_result.status == "failed":
+            failure = pending_result.append_result if pending_result.append_result is not None else False
+            if isinstance(failure, turn_capture.AppendResult) and str(failure.failure_stage or "").startswith("state"):
+                safe_append_jsonl(
+                    ERROR_LOG,
+                    {
+                        "captured_at": utc_now(),
+                        "event": str(data.get("hook_event_name") or "Stop"),
+                        "error": "stop_marker_write_failed",
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "failure_stage": failure.failure_stage,
+                        "failure_reason": failure.failure_reason,
+                    },
+                )
+            else:
+                log_raw_append_failed(data, session_id, turn_id, record, failure)
         return
 
     start_file_size = start.get("start_file_size")
@@ -813,27 +819,22 @@ def handle_stop(data: dict[str, Any]) -> None:
         )
         return
 
-    start_usage = normalize_usage(start.get("start_token_usage"))
-    end_usage = normalize_usage(end_snapshot.get("total_token_usage"))
+    resolved_usage = turn_capture.resolved_turn_usage(start, end_snapshot)
+    start_usage = resolved_usage.start_usage
+    end_usage = resolved_usage.end_usage
     model_call_count, model_calls = model_call_breakdown(end_snapshot)
     record = base_record(data, session_id, turn_id, transcript_path)
-    stopped_at = utc_now()
-    start_usage_source = start.get("start_usage_source")
-    if not start_usage_source:
-        start_snapshot = start.get("start_token_snapshot")
-        start_usage_source = "legacy_full_scan" if isinstance(start_snapshot, dict) and start_snapshot.get("found") else "unavailable"
-    start_usage_source = str(start_usage_source)
-    usage = usage_delta(start_usage, end_usage)
-    estimated = False
+    stopped_at = str(end_snapshot.get("turn_stopped_at") or utc_now())
+    turn_status = str(end_snapshot.get("turn_status") or "completed")
+    usage = resolved_usage.usage
+    estimated = resolved_usage.estimated
     token_source = record["token_source"]
-    if start_usage_source == "unavailable":
-        usage = usage_from_model_calls(end_snapshot)
-        estimated = True
+    if resolved_usage.start_usage_source == "unavailable":
         token_source = "transcript_path token_count.info.last_token_usage aggregate after start offset"
     record.update(
         {
-            "turn_status": "completed",
-            "lifecycle_end_reason": None,
+            "turn_status": turn_status,
+            "lifecycle_end_reason": end_snapshot.get("lifecycle_end_reason") if turn_status == "aborted" else None,
             "token_resolution_status": turn_resolution.RESOLVED,
             "token_resolution_reason": None,
             "started_at": start.get("captured_at"),
@@ -851,14 +852,15 @@ def handle_stop(data: dict[str, Any]) -> None:
             "token_source": token_source,
         }
     )
-    append_result = append_prompt_usage(record, detailed=True)
-    if append_result:
-        try:
-            path.unlink()
-        except OSError:
-            pass
-    else:
-        log_raw_append_failed(data, session_id, turn_id, record, append_result)
+    finalization = turn_capture.finalize_prompt_usage_result(
+        record,
+        state_path=path,
+        base_dir=BASE_DIR,
+        lock_timeout_ms=HOOK_APPEND_LOCK_TIMEOUT_MS,
+    )
+    if not finalization:
+        assert finalization.append_result is not None
+        log_raw_append_failed(data, session_id, turn_id, record, finalization.append_result)
 
 
 def main() -> int:

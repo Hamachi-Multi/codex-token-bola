@@ -23,25 +23,40 @@ without sending transcripts to another service.
 <details>
 <summary>More dashboard views</summary>
 
-#### Turns
+<details>
+<summary>Turns</summary>
 
 ![Turn list and selected turn details with sample data](./docs/assets/dashboard/turns.png)
 
-#### Tools
+</details>
+
+<details>
+<summary>Tools</summary>
 
 ![Tool usage and tool details with sample data](./docs/assets/dashboard/tools.png)
 
-#### Subagents
+</details>
+
+<details>
+<summary>Subagents</summary>
 
 ![Subagent attribution and detail views with sample data](./docs/assets/dashboard/subagents.png)
 
-#### Cleanup
+</details>
+
+<details>
+<summary>Cleanup</summary>
 
 ![Cleanup retention preview with sample data](./docs/assets/dashboard/cleanup.png)
 
-#### Settings
+</details>
+
+<details>
+<summary>Settings</summary>
 
 ![Dashboard settings](./docs/assets/dashboard/settings.png)
+
+</details>
 
 </details>
 

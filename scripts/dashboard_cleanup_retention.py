@@ -5,7 +5,8 @@ from __future__ import annotations
 import pathlib
 import sys
 import uuid
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -24,6 +25,7 @@ from dashboard_cleanup_recovery import (
     clear_cleanup_retention_job,
     commit_pruned_turn_state,
     discard_pruned_turn_state_stage,
+    manifest_segments_sha256,
     read_cleanup_retention_job,
     read_cleanup_retention_job_model,
     recover_retention_cleanup,
@@ -32,6 +34,13 @@ from dashboard_cleanup_recovery import (
     write_cleanup_retention_job,
 )
 from retention_models import RetentionJob, RetentionPhase
+
+
+@dataclass(frozen=True)
+class RetentionApplyResult:
+    summary: dict[str, Any]
+    marker_state: Literal["persisted", "cleared"]
+    job: RetentionJob | None
 
 
 def pending_turn_state_payload(path: pathlib.Path) -> dict[str, Any] | None:
@@ -243,7 +252,7 @@ def discard_delete_logs_older_than_plan(plan: dict[str, Any] | None) -> None:
         )
 
 
-def apply_delete_logs_older_than_plan(plan: dict[str, Any]) -> dict[str, Any]:
+def apply_delete_logs_older_than_plan(plan: dict[str, Any]) -> RetentionApplyResult:
     base = pathlib.Path(str(plan["base"]))
     cutoff = float(plan["cutoff"])
     untracked_plans = plan.get("untracked", [])
@@ -261,15 +270,26 @@ def apply_delete_logs_older_than_plan(plan: dict[str, Any]) -> dict[str, Any]:
         "operation_job_id": str(plan.get("operation_job_id") or "") or f"retention:{uuid.uuid4().hex}",
         "pruned_state_job_id": staged_pruned_turn_state,
     }
+    initial_job = read_cleanup_retention_job_model(base)
+    attached_to_reset_operation = bool(
+        initial_job is not None
+        and initial_job.operation_job_id == operation_fields["operation_job_id"]
+        and initial_job.phase is RetentionPhase.DERIVED_RESET_COMPLETE
+    )
 
-    def write_job(phase: RetentionPhase, **fields: Any) -> None:
+    def write_job(
+        phase: RetentionPhase,
+        *,
+        clear_fields: tuple[str, ...] = (),
+        **fields: Any,
+    ) -> None:
         current = read_cleanup_retention_job_model(base)
         if current is None:
             if phase is not RetentionPhase.PLANNED:
                 raise raw_segments.ManifestError(f"cannot start retention apply at phase {phase.value!r}")
             job = RetentionJob.create_at(phase, **operation_fields, **fields)
         else:
-            job = current.transition(phase, **fields)
+            job = current.transition(phase, clear_fields=clear_fields, **fields)
         write_cleanup_retention_job(base, job)
 
     write_job(
@@ -279,6 +299,8 @@ def apply_delete_logs_older_than_plan(plan: dict[str, Any]) -> dict[str, Any]:
         physical_delete_pending=False,
         derived_rebuild_required=True,
         recovery_required=True,
+        raw_segments_before_sha256=manifest_segments_sha256(segment_plan.get("previous_manifest") or {}),
+        raw_segments_after_sha256=manifest_segments_sha256(segment_plan.get("next_manifest") or {}),
     )
     try:
         segment_apply = raw_segments.apply_segment_plans(base, segment_plan)
@@ -286,6 +308,7 @@ def apply_delete_logs_older_than_plan(plan: dict[str, Any]) -> dict[str, Any]:
         if bool(segment_apply.get("physical_delete_pending")):
             write_job(
                 RetentionPhase.PHYSICAL_DELETE_PENDING,
+                clear_fields=("pruned_state_job_id", "pruned_state_commit_ready"),
                 cutoff_unix=cutoff,
                 physical_delete_pending=True,
                 derived_rebuild_required=True,
@@ -296,6 +319,7 @@ def apply_delete_logs_older_than_plan(plan: dict[str, Any]) -> dict[str, Any]:
         else:
             write_job(
                 RetentionPhase.LOGICAL_DELETE_COMMITTED,
+                clear_fields=("pruned_state_job_id", "pruned_state_commit_ready"),
                 cutoff_unix=cutoff,
                 physical_delete_pending=False,
                 derived_rebuild_required=True,
@@ -349,9 +373,26 @@ def apply_delete_logs_older_than_plan(plan: dict[str, Any]) -> dict[str, Any]:
             physical_delete_pending=physical_delete_pending,
             pending_files=int(segment_apply.get("pending_files") or 0),
         )
+    elif attached_to_reset_operation:
+        write_job(
+            RetentionPhase.LOGICAL_DELETE_COMMITTED,
+            cutoff_unix=cutoff,
+            deleted_rows=0,
+            derived_rebuild_required=True,
+            physical_delete_pending=False,
+            pending_files=0,
+        )
+        write_job(
+            RetentionPhase.DERIVED_REBUILD_REQUIRED,
+            cutoff_unix=cutoff,
+            deleted_rows=0,
+            derived_rebuild_required=True,
+            physical_delete_pending=False,
+            pending_files=0,
+        )
     else:
         clear_cleanup_retention_job(base)
-    return {
+    summary = {
         "cutoff_unix": cutoff,
         "scanned_rows": scanned_rows,
         "deleted_rows": deleted_rows,
@@ -368,8 +409,14 @@ def apply_delete_logs_older_than_plan(plan: dict[str, Any]) -> dict[str, Any]:
         "changed_files": segment_deleted_files + segment_rewritten_files + deleted_state_files,
         "files": [],
     }
+    final_job = read_cleanup_retention_job_model(base)
+    return RetentionApplyResult(
+        summary=summary,
+        marker_state="persisted" if final_job is not None else "cleared",
+        job=final_job,
+    )
 
 
 def delete_logs_older_than(token_usage_root: pathlib.Path | str, cutoff_unix: float) -> dict[str, Any]:
     preflight_delete_logs_older_than(token_usage_root, cutoff_unix)
-    return apply_delete_logs_older_than_plan(plan_delete_logs_older_than(token_usage_root, cutoff_unix))
+    return apply_delete_logs_older_than_plan(plan_delete_logs_older_than(token_usage_root, cutoff_unix)).summary

@@ -301,9 +301,17 @@ def check_cost_rate_settings(page, base_url: str) -> None:
 
     default_row.locator("[data-cost-rate-edit]").click()
     override_editor = selected_detail.locator("[data-cost-rate-editor]")
+    page.wait_for_function(
+        """
+        () => document.activeElement ===
+          document.querySelector('[data-cost-rate-editor] input:not([type="hidden"])')
+        """
+    )
     override_editor.locator('[name="input_price"]').fill("4.25")
     override_editor.locator('[name="cached_input_price"]').fill("0.425")
     override_editor.locator('[name="output_price"]').fill("25.5")
+    page.clock.install()
+    page.clock.pause_at(page.evaluate("() => Date.now()"))
     page.evaluate(
         """
         () => {
@@ -313,7 +321,10 @@ def check_cost_rate_settings(page, base_url: str) -> None:
             const url = typeof resource === 'string' ? resource : resource.url;
             if (url.endsWith('/api/cost-rates') && String(options.method || 'GET').toUpperCase() === 'POST') {
               return new Promise((resolve, reject) => {
-                window.setTimeout(() => nativeFetch(resource, options).then(resolve, reject), 260);
+                window.__releaseCostRateSave = () => {
+                  delete window.__releaseCostRateSave;
+                  nativeFetch(resource, options).then(resolve, reject);
+                };
               });
             }
             return nativeFetch(resource, options);
@@ -322,7 +333,7 @@ def check_cost_rate_settings(page, base_url: str) -> None:
         """
     )
     override_editor.locator('button[type="submit"]').click()
-    page.wait_for_timeout(50)
+    page.clock.fast_forward(119)
     early_save_state = page.evaluate(
         """
         () => ({
@@ -335,7 +346,7 @@ def check_cost_rate_settings(page, base_url: str) -> None:
         not early_save_state["addModelDisabled"] and early_save_state["status"] == initial_cost_rate_status,
         f"fast cost-rate saves should not flash a transient busy state: {early_save_state}",
     )
-    page.wait_for_timeout(120)
+    page.clock.fast_forward(1)
     delayed_save_state = page.evaluate(
         """
         () => ({
@@ -348,8 +359,23 @@ def check_cost_rate_settings(page, base_url: str) -> None:
         delayed_save_state["addModelDisabled"] and delayed_save_state["status"] == "Saving cost rate",
         f"slow cost-rate saves should expose a stable busy state: {delayed_save_state}",
     )
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/cost-rates")
+        and response.request.method == "POST"
+    ) as save_response:
+        page.evaluate("() => window.__releaseCostRateSave()")
+    page.clock.resume()
+    assert_true(save_response.value.ok, "Cost-rate save should complete successfully")
     page.wait_for_function("() => !document.querySelector('#cost-rate-recalculate').disabled")
-    page.evaluate("() => { window.fetch = window.__costRateNativeFetch; delete window.__costRateNativeFetch; }")
+    page.evaluate(
+        """
+        () => {
+          window.fetch = window.__costRateNativeFetch;
+          delete window.__costRateNativeFetch;
+          delete window.__releaseCostRateSave;
+        }
+        """
+    )
     assert_true(
         (page.locator("#cost-rate-status").text_content() or "").strip() == "",
         "saving a price should enable Recalculate without adding a separate status message",

@@ -863,11 +863,21 @@ def applied_offset_metadata() -> dict[str, Any]:
 
 
 def analysis_input_fingerprint() -> str:
-    return analysis_inputs.paths_fingerprint([STATE_DB, SESSION_INDEX, RETENTION_PRUNED_TURNS_FILE])
+    return analysis_inputs.paths_fingerprint([STATE_DB, SESSION_INDEX, *retention_input_paths()])
 
 
 def retention_input_fingerprint() -> str:
-    return analysis_inputs.paths_fingerprint([RETENTION_PRUNED_TURNS_FILE])
+    return analysis_inputs.paths_fingerprint(retention_input_paths())
+
+
+def retention_input_paths() -> list[pathlib.Path]:
+    standard_layout = RETENTION_PRUNED_TURNS_FILE.parent.name == "state"
+    if standard_layout:
+        return retention_pruned_store.fingerprint_paths(RETENTION_PRUNED_TURNS_FILE.parent.parent)
+    return [
+        RETENTION_PRUNED_TURNS_FILE,
+        RETENTION_PRUNED_TURNS_FILE.with_name("retention-pruned-turns.pending.json"),
+    ]
 
 
 def write_build_work_progress(
