@@ -308,8 +308,16 @@ Acknowledgement marks review only and retains the `bad/` evidence.
 
 Cost Units use each model's default price, then apply the latest dated price
 change for the UTC turn date. Built-in defaults cover the supported GPT-5.1,
-GPT-5.4, GPT-5.5, and GPT-5.6 families. Add new models, overrides, and dated
+GPT-5.4, GPT-5.5, GPT-5.6 families, and GPT-6 Astra. Add new models, overrides, and dated
 price changes in **Settings**.
+
+GPT-6 Astra (`gpt-6-astra`) uses Standard short-context API prices of $10 input,
+$1 cached input, and $50 output per million tokens, verified against the
+[official model pricing](https://developers.openai.com/api/docs/models/gpt-6-astra)
+on 2026-09-05. This is a default rate, not a dated price change.
+Cost Units estimate cost from turn totals; they do not model per-request
+long-context surcharges, Fast/Batch/Flex multipliers, or separate cache-write
+charges. They are not a measurement of ChatGPT subscription credits or billing.
 
 ```text
 Cost Units = non-cached input tokens * input price

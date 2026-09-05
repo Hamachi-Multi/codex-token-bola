@@ -133,9 +133,11 @@ GPT_55_URL = "https://developers.openai.com/api/docs/models/gpt-5.5"
 GPT_56_URL = "https://openai.com/index/gpt-5-6/"
 GPT_56_REPRICE_URL = "https://openai.com/index/advancing-the-price-performance-frontier-with-gpt-5-6/"
 GPT_56_SOL_URL = "https://developers.openai.com/api/docs/models/gpt-5.6-sol"
+GPT_6_ASTRA_URL = "https://developers.openai.com/api/docs/models/gpt-6-astra"
 
 
 BUILTIN_RATES: tuple[CostRate, ...] = (
+    _builtin("gpt-6-astra", None, "10", "1", "50", GPT_6_ASTRA_URL),
     _builtin("gpt-5.1", None, "1.25", "0.125", "10", GPT_51_URL),
     _builtin("gpt-5.1-codex", None, "1.25", "0.125", "10", GPT_51_URL),
     _builtin("gpt-5.1-codex-max", None, "1.25", "0.125", "10", GPT_51_URL),

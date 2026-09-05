@@ -31,6 +31,25 @@ except ModuleNotFoundError:
 
 
 class CostRateAnalyticsTests(unittest.TestCase):
+    def test_astra_usage_is_priced_with_standard_builtin_rates(self) -> None:
+        build = load_module("build_analytics_astra_rates_test", ROOT / "scripts" / "build_analytics.py")
+        catalog, _revision = build.cost_rates.load_catalog(pathlib.Path("/nonexistent/cost-rates.json"))
+        with mock.patch.object(build, "COST_RATE_CATALOG", catalog):
+            cost_pico_usd, cost_units, rate = build.priced_usage(
+                model="gpt-6-astra",
+                started_at_unix=build.parse_time("2026-09-05T00:00:00Z"),
+                non_cached_input=100_000,
+                cached_input=50_000,
+                output=10_000,
+            )
+        self.assertEqual(cost_pico_usd, 1_550_000_000_000)
+        self.assertEqual(cost_units, 1_550_000.0)
+        self.assertIsNotNone(rate)
+        assert rate is not None
+        self.assertTrue(rate.is_default)
+        self.assertEqual(rate.source, "built-in")
+        self.assertEqual(rate.source_url, "https://developers.openai.com/api/docs/models/gpt-6-astra")
+
     def test_priced_usage_uses_effective_model_rate(self) -> None:
         build = load_module("build_analytics_weighted_units_test", ROOT / "scripts" / "build_analytics.py")
         cost_pico_usd, cost_units, rate = build.priced_usage(
@@ -307,5 +326,3 @@ class CostRateAnalyticsTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 2)
         self.assertEqual(json.loads(output.getvalue()), error.payload())
-
-
